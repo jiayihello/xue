@@ -1,0 +1,189 @@
+═══════════════════════════════════════════════════════════════
+  CPU 使用率限制功能 - 快速入门
+═══════════════════════════════════════════════════════════════
+
+🎯 功能说明
+──────────────────────────────────────────────────────────────
+可以设置容器的 CPU 使用率百分比限制，就像设置内存大小一样。
+
+百分比含义：
+  50%  = 限制使用 0.5 个 CPU 核心
+  100% = 限制使用 1 个完整的 CPU 核心
+  200% = 限制使用 2 个完整的 CPU 核心
+  0    = 移除限制（无限制）
+
+═══════════════════════════════════════════════════════════════
+🚀 快速使用
+═══════════════════════════════════════════════════════════════
+
+1. 创建容器时设置 CPU 限制
+──────────────────────────────────────────────────────────────
+
+API 请求添加 cpu_percent 参数：
+
+curl -X POST http://your-server:5000/api/create \
+  -H "apikey: your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hostname": "test-container",
+    "cpu": "2",
+    "cpu_percent": 50,    ← 新增：CPU 限制为 50%
+    "ram": 512,
+    "disk": 10240
+  }'
+
+
+2. 修改现有容器的 CPU 限制
+──────────────────────────────────────────────────────────────
+
+方法 A：使用管理脚本（推荐）
+
+# 设置 CPU 限制为 50%
+python3 manage_cpu_limit.py set test-container 50
+
+# 移除 CPU 限制
+python3 manage_cpu_limit.py set test-container 0
+
+# 查看容器 CPU 限制
+python3 manage_cpu_limit.py get test-container
+
+# 列出所有容器的 CPU 限制
+python3 manage_cpu_limit.py list
+
+
+方法 B：使用 API
+
+# 设置 CPU 限制为 50%
+curl -X POST http://your-server:5000/api/cpu/limit/update \
+  -H "apikey: your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname": "test-container", "cpu_percent": 50}'
+
+# 移除 CPU 限制
+curl -X POST http://your-server:5000/api/cpu/limit/update \
+  -H "apikey: your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"hostname": "test-container", "cpu_percent": 0}'
+
+
+方法 C：直接使用 LXC 命令
+
+# 设置 CPU 限制为 50%
+lxc config set test-container limits.cpu.allowance 50%
+
+# 移除 CPU 限制
+lxc config unset test-container limits.cpu.allowance
+
+
+3. 批量设置多个容器
+──────────────────────────────────────────────────────────────
+
+使用管理脚本：
+
+python3 manage_cpu_limit.py batch \
+  container1:50 \
+  container2:100 \
+  container3:150
+
+
+使用 API：
+
+curl -X POST http://your-server:5000/api/cpu/limit/batch \
+  -H "apikey: your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "updates": [
+      {"hostname": "container1", "cpu_percent": 50},
+      {"hostname": "container2", "cpu_percent": 100},
+      {"hostname": "container3", "cpu_percent": 150}
+    ]
+  }'
+
+
+4. 查看容器 CPU 使用情况
+──────────────────────────────────────────────────────────────
+
+# 查看容器信息
+lxc info test-container | grep -A 5 "CPU usage"
+
+# 实时监控
+watch -n 1 'lxc info test-container | grep "CPU usage"'
+
+
+═══════════════════════════════════════════════════════════════
+📋 管理脚本命令
+═══════════════════════════════════════════════════════════════
+
+manage_cpu_limit.py 支持以下命令：
+
+命令                                    说明
+────────────────────────────────────────────────────────────
+set <容器名> <百分比>                   设置 CPU 限制
+get <容器名>                            查看 CPU 限制
+list                                    列出所有容器的 CPU 限制
+list --filter <关键词>                  过滤显示容器
+batch <容器:百分比> ...                 批量设置
+
+示例：
+  python3 manage_cpu_limit.py set web-01 50
+  python3 manage_cpu_limit.py get web-01
+  python3 manage_cpu_limit.py list --filter web
+  python3 manage_cpu_limit.py batch web-01:50 web-02:100
+
+
+═══════════════════════════════════════════════════════════════
+🔧 API 接口
+═══════════════════════════════════════════════════════════════
+
+1. 更新 CPU 限制
+   POST /api/cpu/limit/update
+   Body: {"hostname": "xxx", "cpu_percent": 50}
+
+2. 获取 CPU 限制
+   GET /api/cpu/limit/get?hostname=xxx
+
+3. 批量更新
+   POST /api/cpu/limit/batch
+   Body: {"updates": [{"hostname": "xxx", "cpu_percent": 50}, ...]}
+
+
+═══════════════════════════════════════════════════════════════
+💡 使用建议
+═══════════════════════════════════════════════════════════════
+
+1. 测试环境容器建议限制在 30-50%
+2. Web 服务器建议 50-100%
+3. 数据库服务器建议 100-200%
+4. 开发环境可以不限制或设置较高值
+5. 根据实际负载动态调整
+
+
+═══════════════════════════════════════════════════════════════
+⚠️ 注意事项
+═══════════════════════════════════════════════════════════════
+
+1. CPU 限制是"软限制"
+   - 系统空闲时可能超过设置值
+   - 系统繁忙时会严格限制
+
+2. 与 limits.cpu 的关系
+   - limits.cpu：指定使用哪些 CPU 核心
+   - limits.cpu.allowance：限制使用率百分比
+   - 两者可以同时使用
+
+3. 立即生效
+   - 设置后立即生效，无需重启容器
+
+4. 移除限制
+   - 设置为 0 即可移除限制
+
+
+═══════════════════════════════════════════════════════════════
+📚 更多帮助
+═══════════════════════════════════════════════════════════════
+
+详细文档： CPU_LIMIT_GUIDE.md
+管理脚本： python3 manage_cpu_limit.py --help
+
+═══════════════════════════════════════════════════════════════
+
