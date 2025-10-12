@@ -1,5 +1,0 @@
-Flask
-pylxd
-python-dateutil
-configparser
-python-dateutil
