@@ -357,6 +357,45 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
             log_error "未找到 app.ini.example"
             exit 1
         fi
+    else
+        log_warn "app.ini 已存在，将更新网络配置..."
+    fi
+    
+    # 更新 app.ini 中的网络配置（无论是新建还是已存在）
+    log_info "更新 app.ini 网络配置..."
+    
+    # 更新 NAT_LISTEN_IP
+    if grep -q "^NAT_LISTEN_IP" app.ini; then
+        sed -i "s|^NAT_LISTEN_IP.*|NAT_LISTEN_IP = $IPV4_ADDRESS|g" app.ini
+    else
+        echo "NAT_LISTEN_IP = $IPV4_ADDRESS" >> app.ini
+    fi
+    
+    # 更新 IPV6_MODE
+    if [ -n "$IPV6_MODE" ]; then
+        if grep -q "^IPV6_MODE" app.ini; then
+            sed -i "s|^IPV6_MODE.*|IPV6_MODE = $IPV6_MODE|g" app.ini
+        else
+            echo "IPV6_MODE = $IPV6_MODE" >> app.ini
+        fi
+    fi
+    
+    # 更新 IPV6_PREFIX
+    if [ -n "$IPV6_PREFIX" ]; then
+        if grep -q "^IPV6_PREFIX" app.ini; then
+            sed -i "s|^IPV6_PREFIX.*|IPV6_PREFIX = $IPV6_PREFIX|g" app.ini
+        else
+            echo "IPV6_PREFIX = $IPV6_PREFIX" >> app.ini
+        fi
+    fi
+    
+    log_ok "✓ app.ini 网络配置已更新"
+    log_info "  NAT_LISTEN_IP = $IPV4_ADDRESS"
+    if [ -n "$IPV6_MODE" ]; then
+        log_info "  IPV6_MODE = $IPV6_MODE"
+        if [ -n "$IPV6_PREFIX" ]; then
+            log_info "  IPV6_PREFIX = $IPV6_PREFIX"
+        fi
     fi
     
     # 使用 setup_lxd_api_service.sh 创建服务
