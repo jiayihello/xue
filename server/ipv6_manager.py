@@ -45,8 +45,13 @@ def _addr_at(prefix_net: ipaddress.IPv6Network, index: int) -> ipaddress.IPv6Add
     return ipaddress.IPv6Address(addr_int)
 
 
-def allocate(hostname: str) -> Optional[str]:
-    """为容器名分配可路由IPv6地址（从 /64 前缀内顺序分配）。
+def allocate(hostname: str, custom_ipv6: Optional[str] = None) -> Optional[str]:
+    """为容器名分配可路由IPv6地址。
+    
+    Args:
+        hostname: 容器名
+        custom_ipv6: 可选的自定义IPv6地址（/128格式）
+    
     返回字符串形式的IPv6地址，失败返回None。
     """
     mode = getattr(app_config, 'ipv6_mode', 'OFF')
@@ -54,9 +59,56 @@ def allocate(hostname: str) -> Optional[str]:
         logger.debug("IPv6分配跳过：当前模式不是 ROUTED")
         return None
 
+    state = _load_state()
+    allocations = state.get('allocations', {})
+
+    # 已分配则直接返回，确保重启后地址稳定
+    if hostname in allocations:
+        return allocations[hostname]
+
+    # 如果指定了自定义IPv6地址，使用它
+    if custom_ipv6:
+        try:
+            # 验证IPv6地址格式
+            ipv6_obj = ipaddress.ip_address(custom_ipv6.split('/')[0])
+            if not isinstance(ipv6_obj, ipaddress.IPv6Address):
+                raise ValueError('不是有效的IPv6地址')
+            
+            # 检查是否已被占用
+            used_addrs = set(allocations.values())
+            if custom_ipv6 in used_addrs:
+                logger.error(f"IPv6地址 {custom_ipv6} 已被占用")
+                return None
+            
+            # 分配自定义地址
+            allocations[hostname] = custom_ipv6
+            state['allocations'] = allocations
+            _save_state(state)
+            logger.info(f"为 {hostname} 分配自定义IPv6地址: {custom_ipv6}")
+            return custom_ipv6
+        except Exception as e:
+            logger.error(f"自定义IPv6地址 {custom_ipv6} 无效: {e}")
+            return None
+
+    # 检查是否配置了预定义地址池
+    ipv6_pool = getattr(app_config, 'ipv6_address_pool', None)
+    if ipv6_pool and isinstance(ipv6_pool, list):
+        # 从地址池中选择未使用的地址
+        used_addrs = set(allocations.values())
+        for addr in ipv6_pool:
+            if addr not in used_addrs:
+                allocations[hostname] = addr
+                state['allocations'] = allocations
+                _save_state(state)
+                logger.info(f"为 {hostname} 从地址池分配IPv6: {addr}")
+                return addr
+        logger.error("IPv6地址池已耗尽")
+        return None
+
+    # 否则从 /64 前缀自动分配
     prefix = getattr(app_config, 'ipv6_prefix', None)
     if not prefix:
-        logger.warning("IPv6分配失败：未配置 IPV6_PREFIX")
+        logger.warning("IPv6分配失败：未配置 IPV6_PREFIX 或 IPV6_ADDRESS_POOL")
         return None
 
     try:
@@ -66,13 +118,6 @@ def allocate(hostname: str) -> Optional[str]:
     except Exception as e:
         logger.error(str(e))
         return None
-
-    state = _load_state()
-    allocations = state.get('allocations', {})
-
-    # 已分配则直接返回，确保重启后地址稳定
-    if hostname in allocations:
-        return allocations[hostname]
 
     # 从cursor开始寻找未占用地址，跳过前16个地址作为保留
     cursor = int(state.get('cursor', 0))

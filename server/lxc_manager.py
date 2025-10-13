@@ -496,9 +496,11 @@ class LXCManager:
 
             # IPv6: 在 ROUTED 模式下为容器分配独立IPv6并添加routed网卡，并为上游添加NDP代理
             try:
-                if app_config.ipv6_mode == 'ROUTED' and app_config.ipv6_prefix:
+                if app_config.ipv6_mode == 'ROUTED':
                     from ipv6_manager import allocate
-                    ipv6_addr = allocate(hostname)
+                    # 支持自定义 IPv6 地址（从 params 传递）
+                    custom_ipv6 = params.get('custom_ipv6')
+                    ipv6_addr = allocate(hostname, custom_ipv6=custom_ipv6)
                     if ipv6_addr:
                         device_name_v6 = 'eth0v6'
                         parent_if = app_config.ipv6_interface or app_config.main_interface

@@ -28,6 +28,15 @@ class AppConfig:
         self.ipv6_mode = parser.get('lxc', 'IPV6_MODE', fallback='OFF').upper()  # OFF | ROUTED | NDP_PROXY | NAT66
         self.ipv6_prefix = parser.get('lxc', 'IPV6_PREFIX', fallback=None)       # 例如 2001:db8:abcd:1234::/64
         self.ipv6_interface = parser.get('lxc', 'IPV6_INTERFACE', fallback=self.main_interface)
+        
+        # IPv6 地址池（多个 /128 地址，逗号或分号分隔）
+        pool_str = parser.get('lxc', 'IPV6_ADDRESS_POOL', fallback='').strip()
+        if pool_str:
+            # 支持逗号或分号分隔
+            import re
+            self.ipv6_address_pool = [addr.strip() for addr in re.split(r'[,;]', pool_str) if addr.strip()]
+        else:
+            self.ipv6_address_pool = None
 
         # 端口映射连通性自检开关（严格模式：失败即回滚并报错）。默认开启严格模式。
         self.portmap_selftest_strict = parser.getboolean('lxc', 'PORTMAP_SELFTEST_STRICT', fallback=True)
