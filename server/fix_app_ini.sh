@@ -25,9 +25,9 @@ fi
 # 显示当前配置
 echo -e "${COLOR_CYAN}当前 app.ini 配置:${COLOR_NC}"
 echo "----------------------------------------"
-grep "^NAT_LISTEN_IP" app.ini || echo "NAT_LISTEN_IP = (未设置)"
-grep "^IPV6_MODE" app.ini || echo "IPV6_MODE = (未设置)"
-grep "^IPV6_PREFIX" app.ini || echo "IPV6_PREFIX = (未设置)"
+grep "^NAT_LISTEN_IP\s*=" app.ini || echo "NAT_LISTEN_IP = (未设置)"
+grep "^IPV6_MODE\s*=" app.ini || echo "IPV6_MODE = (未设置)"
+grep "^IPV6_PREFIX\s*=" app.ini || echo "IPV6_PREFIX = (未设置)"
 echo "----------------------------------------"
 echo ""
 
@@ -113,16 +113,16 @@ cp app.ini app.ini.backup.$(date +%Y%m%d_%H%M%S)
 echo -e "${COLOR_GREEN}[✓] 已备份原配置${COLOR_NC}"
 
 # 更新 NAT_LISTEN_IP
-if grep -q "^NAT_LISTEN_IP" app.ini; then
-    sed -i "s|^NAT_LISTEN_IP.*|NAT_LISTEN_IP = $IPV4_ADDRESS|g" app.ini
+if grep -q "^NAT_LISTEN_IP\s*=" app.ini; then
+    sed -i "s|^NAT_LISTEN_IP\s*=.*|NAT_LISTEN_IP = $IPV4_ADDRESS|g" app.ini
 else
     echo "NAT_LISTEN_IP = $IPV4_ADDRESS" >> app.ini
 fi
 echo -e "${COLOR_GREEN}[✓] 已更新 NAT_LISTEN_IP${COLOR_NC}"
 
 # 更新 IPV6_MODE
-if grep -q "^IPV6_MODE" app.ini; then
-    sed -i "s|^IPV6_MODE.*|IPV6_MODE = $IPV6_MODE|g" app.ini
+if grep -q "^IPV6_MODE\s*=" app.ini; then
+    sed -i "s|^IPV6_MODE\s*=.*|IPV6_MODE = $IPV6_MODE|g" app.ini
 else
     echo "IPV6_MODE = $IPV6_MODE" >> app.ini
 fi
@@ -130,8 +130,8 @@ echo -e "${COLOR_GREEN}[✓] 已更新 IPV6_MODE${COLOR_NC}"
 
 # 更新 IPV6_PREFIX
 if [ -n "$IPV6_PREFIX" ]; then
-    if grep -q "^IPV6_PREFIX" app.ini; then
-        sed -i "s|^IPV6_PREFIX.*|IPV6_PREFIX = $IPV6_PREFIX|g" app.ini
+    if grep -q "^IPV6_PREFIX\s*=" app.ini; then
+        sed -i "s|^IPV6_PREFIX\s*=.*|IPV6_PREFIX = $IPV6_PREFIX|g" app.ini
     else
         echo "IPV6_PREFIX = $IPV6_PREFIX" >> app.ini
     fi
@@ -147,9 +147,9 @@ echo ""
 # 显示新配置
 echo -e "${COLOR_CYAN}新的 app.ini 配置:${COLOR_NC}"
 echo "----------------------------------------"
-grep "^NAT_LISTEN_IP" app.ini
-grep "^IPV6_MODE" app.ini
-grep "^IPV6_PREFIX" app.ini 2>/dev/null || echo "IPV6_PREFIX = (未设置)"
+grep "^NAT_LISTEN_IP\s*=" app.ini
+grep "^IPV6_MODE\s*=" app.ini
+grep "^IPV6_PREFIX\s*=" app.ini 2>/dev/null || echo "IPV6_PREFIX = (未设置)"
 echo "----------------------------------------"
 echo ""
 

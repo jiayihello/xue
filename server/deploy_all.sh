@@ -365,16 +365,16 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     log_info "更新 app.ini 网络配置..."
     
     # 更新 NAT_LISTEN_IP
-    if grep -q "^NAT_LISTEN_IP" app.ini; then
-        sed -i "s|^NAT_LISTEN_IP.*|NAT_LISTEN_IP = $IPV4_ADDRESS|g" app.ini
+    if grep -q "^NAT_LISTEN_IP\s*=" app.ini; then
+        sed -i "s|^NAT_LISTEN_IP\s*=.*|NAT_LISTEN_IP = $IPV4_ADDRESS|g" app.ini
     else
         echo "NAT_LISTEN_IP = $IPV4_ADDRESS" >> app.ini
     fi
     
     # 更新 IPV6_MODE
     if [ -n "$IPV6_MODE" ]; then
-        if grep -q "^IPV6_MODE" app.ini; then
-            sed -i "s|^IPV6_MODE.*|IPV6_MODE = $IPV6_MODE|g" app.ini
+        if grep -q "^IPV6_MODE\s*=" app.ini; then
+            sed -i "s|^IPV6_MODE\s*=.*|IPV6_MODE = $IPV6_MODE|g" app.ini
         else
             echo "IPV6_MODE = $IPV6_MODE" >> app.ini
         fi
@@ -382,8 +382,8 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     
     # 更新 IPV6_PREFIX
     if [ -n "$IPV6_PREFIX" ]; then
-        if grep -q "^IPV6_PREFIX" app.ini; then
-            sed -i "s|^IPV6_PREFIX.*|IPV6_PREFIX = $IPV6_PREFIX|g" app.ini
+        if grep -q "^IPV6_PREFIX\s*=" app.ini; then
+            sed -i "s|^IPV6_PREFIX\s*=.*|IPV6_PREFIX = $IPV6_PREFIX|g" app.ini
         else
             echo "IPV6_PREFIX = $IPV6_PREFIX" >> app.ini
         fi
