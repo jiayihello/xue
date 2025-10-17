@@ -1361,6 +1361,26 @@ deploy_lxd_server() {
         msg_ok "✓ LXD 服务器后端部署完成！"
         msg_ok "==============================================="
         echo ""
+        
+        # 自动运行部署后检查
+        msg_info "开始自动检查部署状态..."
+        sleep 2
+        
+        local check_script="$server_dir/post_deployment_check.sh"
+        if [[ -f "$check_script" ]]; then
+            chmod +x "$check_script"
+            if bash "$check_script"; then
+                echo ""
+                msg_ok "✓ 部署后检查通过！系统运行正常"
+            else
+                echo ""
+                msg_warn "⚠ 部署后检查发现问题，请查看上方详情"
+            fi
+        else
+            msg_warn "未找到检查脚本，跳过自动检查"
+        fi
+        
+        echo ""
         msg_info "后续操作:"
         echo "  1. 查看部署总结（脚本输出）"
         echo "  2. 记录 API Key"

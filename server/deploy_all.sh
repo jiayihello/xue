@@ -538,6 +538,17 @@ if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
 fi
 echo ""
 
+# 提示可以运行检查脚本
+echo -e "${COLOR_CYAN}自动检查部署状态:${COLOR_NC}"
+if [ -f "$SCRIPT_DIR/post_deployment_check.sh" ]; then
+    echo "  bash $SCRIPT_DIR/check_deployment.sh"
+    echo ""
+    echo "  或者直接运行: bash $SCRIPT_DIR/post_deployment_check.sh"
+else
+    echo "  检查脚本未找到"
+fi
+echo ""
+
 log_ok "部署完成！感谢使用 ZJMF-LXD-Server"
 echo ""
 
