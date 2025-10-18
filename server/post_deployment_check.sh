@@ -77,11 +77,21 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 if [ -f "app.ini" ]; then
     check_item "app.ini 存在" "pass"
     
-    # 检查关键配置
-    if grep -q "^API_KEY\s*=" app.ini && [ "$(grep "^API_KEY\s*=" app.ini | cut -d'=' -f2 | tr -d ' ')" != "" ]; then
-        check_item "API_KEY 已配置" "pass"
+    # 检查 TOKEN 配置（不是 API_KEY）
+    if grep -q "^TOKEN\s*=" app.ini && [ "$(grep "^TOKEN\s*=" app.ini | cut -d'=' -f2 | tr -d ' ')" != "" ]; then
+        TOKEN_VALUE=$(grep "^TOKEN\s*=" app.ini | cut -d'=' -f2 | tr -d ' ')
+        check_item "TOKEN 已配置" "pass" "$TOKEN_VALUE"
     else
-        check_item "API_KEY 已配置" "fail" "请设置 API_KEY"
+        check_item "TOKEN 已配置" "warn" "建议设置 TOKEN 用于 API 认证"
+    fi
+    
+    # 读取 HTTP_PORT 配置
+    if grep -q "^HTTP_PORT\s*=" app.ini; then
+        HTTP_PORT=$(grep "^HTTP_PORT\s*=" app.ini | cut -d'=' -f2 | tr -d ' ')
+        check_item "HTTP_PORT 已配置" "pass" "$HTTP_PORT"
+    else
+        HTTP_PORT=8080
+        check_item "HTTP_PORT 已配置" "warn" "使用默认端口 8080"
     fi
     
     if grep -q "^NAT_LISTEN_IP\s*=" app.ini; then
@@ -92,6 +102,7 @@ if [ -f "app.ini" ]; then
     fi
 else
     check_item "app.ini 存在" "fail" "请复制 app.ini.example 并配置"
+    HTTP_PORT=8080
 fi
 
 echo ""
@@ -110,7 +121,7 @@ if [ -f "flow_management.db" ]; then
         check_item "数据库表结构正确" "pass"
         
         CONTAINER_COUNT=$(sqlite3 flow_management.db "SELECT COUNT(*) FROM container_flow_management;" 2>/dev/null || echo "0")
-        check_item "容器记录数" "pass" "$CONTAINER_COUNT 个容器"
+        check_item "数据库中的容器记录" "pass" "$CONTAINER_COUNT 条记录（历史数据，非当前容器）"
     else
         check_item "数据库表结构正确" "fail" "请运行: python3 flow_manager.py"
     fi
@@ -161,15 +172,24 @@ else
     check_item "lxd-flow-continuity.service" "warn" "未安装（可选）"
 fi
 
-# CPU 监控服务
-if systemctl list-unit-files 2>/dev/null | grep -q "lxd-cpu-monitor.service"; then
-    if systemctl is-active --quiet lxd-cpu-monitor; then
-        check_item "lxd-cpu-monitor.service" "pass" "CPU 监控运行中"
+# CPU 监控服务（检查 lxd-cpu-autorestart.service）
+if systemctl list-unit-files 2>/dev/null | grep -q "lxd-cpu-autorestart.service"; then
+    if systemctl is-active --quiet lxd-cpu-autorestart; then
+        check_item "lxd-cpu-autorestart.service" "pass" "CPU 自动重启监控运行中"
     else
-        check_item "lxd-cpu-monitor.service" "warn" "CPU 监控未运行"
+        check_item "lxd-cpu-autorestart.service" "warn" "CPU 监控未运行"
     fi
 else
-    check_item "lxd-cpu-monitor.service" "warn" "未安装（可选）"
+    # 兼容检查旧服务名
+    if systemctl list-unit-files 2>/dev/null | grep -q "lxd-cpu-monitor.service"; then
+        if systemctl is-active --quiet lxd-cpu-monitor; then
+            check_item "lxd-cpu-monitor.service" "pass" "CPU 监控运行中"
+        else
+            check_item "lxd-cpu-monitor.service" "warn" "CPU 监控未运行"
+        fi
+    else
+        check_item "CPU 监控服务" "warn" "未安装（可选）"
+    fi
 fi
 
 # 检查 Cron 任务（流量重置调度器）
@@ -202,18 +222,18 @@ echo ""
 echo -e "${CYAN}[5/8] API 可访问性${NC}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# 检查监听端口
-if ss -tlnp 2>/dev/null | grep -q ":5000"; then
-    check_item "API 监听端口 5000" "pass"
+# 检查监听端口（使用从配置文件读取的端口）
+if ss -tlnp 2>/dev/null | grep -q ":${HTTP_PORT}"; then
+    check_item "API 监听端口 ${HTTP_PORT}" "pass"
     
     # 尝试访问 API
-    if curl -s http://127.0.0.1:5000/api/ping 2>/dev/null | grep -q "pong"; then
+    if curl -s http://127.0.0.1:${HTTP_PORT}/api/ping 2>/dev/null | grep -q "pong"; then
         check_item "API 响应正常" "pass"
     else
-        check_item "API 响应正常" "fail" "无法访问 /api/ping"
+        check_item "API 响应正常" "warn" "无法访问 /api/ping（可能接口不存在）"
     fi
 else
-    check_item "API 监听端口 5000" "fail" "服务未启动"
+    check_item "API 监听端口 ${HTTP_PORT}" "fail" "服务未启动或端口未监听"
 fi
 
 echo ""
@@ -347,7 +367,7 @@ if [ $FAILED_CHECKS -eq 0 ]; then
     echo "     tail -f flow_limit_enforcer.log"
     echo ""
     echo "  3. 测试 API:"
-    echo "     curl http://127.0.0.1:5000/api/ping"
+    echo "     curl http://127.0.0.1:${HTTP_PORT}/api/ping"
     echo ""
     echo "  4. 查看容器:"
     echo "     lxc list"

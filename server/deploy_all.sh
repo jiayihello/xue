@@ -314,7 +314,7 @@ fi
 # ==========================================
 log_step "步骤 10/11: CPU 监控配置"
 
-if ask_yes_no "是否配置 CPU 使用率监控和自动重启?" "n"; then
+if ask_yes_no "是否配置 CPU 使用率监控和自动重启?" "y"; then
     log_info "配置 CPU 监控..."
     
     if [ -f "setup_cpu_autorestart_monitor.sh" ]; then
