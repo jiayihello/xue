@@ -91,6 +91,15 @@ is_lxd_installed() {
 
 configure_snap_path() {
     msg_info "配置 Snap 路径到系统 PATH..."
+    
+    # 确保 /snap 目录存在并正确链接（Debian 特别需要）
+    if [[ ! -d /snap ]] && [[ -d /var/lib/snapd/snap ]]; then
+        msg_info "创建 /snap 符号链接（Debian 系统需要）..."
+        sudo ln -sf /var/lib/snapd/snap /snap
+        msg_ok "✓ /snap 符号链接已创建"
+    fi
+    
+    # 配置 PATH
     if [[ ":$PATH:" != *":/snap/bin:"* ]]; then
         echo 'export PATH=$PATH:/snap/bin' | sudo tee -a /etc/profile.d/snap_path.sh >/dev/null
         export PATH=$PATH:/snap/bin
@@ -98,7 +107,16 @@ configure_snap_path() {
     else
         msg_ok "✓ Snap 路径已存在于系统 PATH 中"
     fi
+    
+    # 等待 snap 二进制文件可用
+    local retry=0
+    while [[ ! -x /snap/bin/lxd ]] && [[ $retry -lt 10 ]]; do
+        msg_warn "等待 LXD snap 安装完成... ($((retry+1))/10)"
+        sleep 2
+        ((retry++))
+    done
 
+    # 创建符号链接
     if [ -x /snap/bin/lxd ] && [ ! -x /usr/local/bin/lxd ]; then
         sudo ln -sf /snap/bin/lxd /usr/local/bin/lxd
         msg_ok "✓ 创建 lxd 符号链接"
@@ -178,13 +196,17 @@ prepare_system_for_lxd() {
         # Debian 版本检测
         if [[ "$ID" == "debian" ]]; then
             case "$VERSION_ID" in
+                "11")
+                    python_version="3.9"
+                    msg_info "检测到 Debian 11 (bullseye)，使用 Python 3.9"
+                    ;;
                 "12")
                     python_version="3.11"
-                    msg_info "检测到 Debian 12，使用 Python 3.11"
+                    msg_info "检测到 Debian 12 (bookworm)，使用 Python 3.11"
                     ;;
                 "13")
                     python_version="3.13"
-                    msg_info "检测到 Debian 13，使用 Python 3.13"
+                    msg_info "检测到 Debian 13 (trixie)，使用 Python 3.13"
                     ;;
                 *)
                     # 自动检测当前 Python 版本
@@ -262,14 +284,43 @@ install_lxd() {
         return 1
     fi
 
-    local steps=(
-        "更新软件包列表;sudo apt-get update -y"
-        "安装 snapd;sudo apt-get install -y snapd"
-        "安装 snap core;sudo snap install core"
-        "通过 Snap 安装 LXD;sudo snap install lxd"
-        "配置 Snap 路径;configure_snap_path"
-        "初始化 LXD;initialize_lxd"
-    )
+    # 检测是否为 Debian 系统
+    local is_debian=false
+    local debian_version=""
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        if [[ "$ID" == "debian" ]]; then
+            is_debian=true
+            debian_version="$VERSION_ID"
+        fi
+    fi
+    
+    # 根据系统选择不同的安装步骤
+    local steps=()
+    if [[ "$is_debian" == true ]]; then
+        msg_info "检测到 Debian $debian_version，将使用 Debian 优化的安装流程"
+        steps=(
+            "更新软件包列表;sudo apt-get update -y"
+            "安装 snapd;sudo apt-get install -y snapd"
+            "启用 snapd 服务;sudo systemctl enable --now snapd"
+            "启用 snapd.socket;sudo systemctl enable --now snapd.socket"
+            "等待 snapd 启动;sleep 5"
+            "创建 snap 符号链接;sudo ln -sf /var/lib/snapd/snap /snap 2>/dev/null || true"
+            "安装 snap core;sudo snap install core"
+            "通过 Snap 安装 LXD;sudo snap install lxd"
+            "配置 Snap 路径;configure_snap_path"
+            "初始化 LXD;initialize_lxd"
+        )
+    else
+        steps=(
+            "更新软件包列表;sudo apt-get update -y"
+            "安装 snapd;sudo apt-get install -y snapd"
+            "安装 snap core;sudo snap install core"
+            "通过 Snap 安装 LXD;sudo snap install lxd"
+            "配置 Snap 路径;configure_snap_path"
+            "初始化 LXD;initialize_lxd"
+        )
+    fi
 
     for i in "${!steps[@]}"; do
         local description="${steps[$i]%%;*}"
