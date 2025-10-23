@@ -1,0 +1,73 @@
+# OpenGFW 规则文件 - 地域限制版
+# 仅拦截来自中国大陆的代理连接
+# 适用于有海外客户，但需要限制国内客户滥用代理的场景
+
+# ============================================
+# 代理协议拦截（仅中国大陆）
+# ============================================
+
+# 1. Shadowsocks / VMess（仅中国大陆）
+- name: block shadowsocks and vmess from china
+  action: block
+  log: true
+  expr: fet != nil && fet.yes && geoip(string(ip.src), "cn")
+
+# 2. Trojan 代理（仅中国大陆）
+- name: block trojan from china
+  action: block
+  log: true
+  expr: trojan != nil && trojan.yes && geoip(string(ip.src), "cn")
+
+# 3. Socks 代理（仅中国大陆）
+- name: block socks from china
+  action: block
+  log: true
+  expr: socks != nil && socks.yes && geoip(string(ip.src), "cn")
+
+# 4. WireGuard VPN（仅中国大陆）
+- name: block wireguard from china
+  action: block
+  log: true
+  expr: wireguard != nil && wireguard.yes && geoip(string(ip.src), "cn")
+
+# ============================================
+# 下载协议拦截（全球）
+# ============================================
+
+# 5. BitTorrent 下载（全球拦截）
+- name: block bittorrent
+  action: block
+  log: true
+  expr: bt != nil && bt.yes
+
+# ============================================
+# 特定域名/服务拦截（全球）
+# ============================================
+
+# 6. 拦截 Ping0 娱乐库（HTTPS）
+- name: block ping0 https
+  action: block
+  log: true
+  expr: string(tls?.req?.sni) endsWith "ping0.cc"
+
+# 7. 拦截 Ping0 娱乐库（HTTP）
+- name: block ping0 http
+  action: block
+  log: true
+  expr: string(http?.req?.headers?.host) endsWith "ping0.cc"
+
+# ============================================
+# 其他可选规则
+# ============================================
+
+# 8. 允许来自特定国家的所有流量
+# - name: allow traffic from us
+#   action: allow
+#   expr: geoip(string(ip.src), "us")
+
+# 9. 拦截来自特定国家的所有流量
+# - name: block traffic from north korea
+#   action: block
+#   log: true
+#   expr: geoip(string(ip.src), "kp")
+

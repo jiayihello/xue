@@ -24,6 +24,9 @@ class AppConfig:
         self.nat_listen_ip = parser.get('lxc', 'NAT_LISTEN_IP', fallback=None)
         self.nat_listen_ipv6 = parser.get('lxc', 'NAT_LISTEN_IPV6', fallback=None)
 
+        # IPv4 相关配置（可选）
+        self.ipv4_mode = parser.get('lxc', 'IPV4_MODE', fallback='BRIDGE').upper()  # BRIDGE | OFF
+
         # IPv6 相关配置（可选）
         self.ipv6_mode = parser.get('lxc', 'IPV6_MODE', fallback='OFF').upper()  # OFF | ROUTED | NDP_PROXY | NAT66
         self.ipv6_prefix = parser.get('lxc', 'IPV6_PREFIX', fallback=None)       # 例如 2001:db8:abcd:1234::/64

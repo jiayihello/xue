@@ -1,0 +1,120 @@
+# OpenGFW 规则文件 - 完全版
+# 拦截所有常见高危协议
+# 适用于 LXD 容器场景，防止客户滥用
+
+# ============================================
+# 代理协议拦截
+# ============================================
+
+# 1. Shadowsocks / VMess（全球拦截）
+- name: block shadowsocks and vmess
+  action: block
+  log: true
+  expr: fet != nil && fet.yes
+
+# 2. Trojan 代理
+- name: block trojan
+  action: block
+  log: true
+  expr: trojan != nil && trojan.yes
+
+# 3. Socks 代理
+- name: block socks
+  action: block
+  log: true
+  expr: socks != nil && socks.yes
+
+# 4. HTTP/HTTPS 代理
+- name: block http proxy
+  action: block
+  log: true
+  expr: http != nil && http.req != nil && http.req.headers != nil && http.req.headers["proxy-connection"] != nil
+
+# ============================================
+# VPN 协议拦截
+# ============================================
+
+# 5. WireGuard VPN
+- name: block wireguard
+  action: block
+  log: true
+  expr: wireguard != nil && wireguard.yes
+
+# 6. OpenVPN（UDP 模式）
+- name: block openvpn udp
+  action: block
+  log: true
+  expr: openvpn != nil && openvpn.yes
+
+# ============================================
+# 下载协议拦截
+# ============================================
+
+# 7. BitTorrent 下载
+- name: block bittorrent
+  action: block
+  log: true
+  expr: bt != nil && bt.yes
+
+# ============================================
+# 特定域名/服务拦截
+# ============================================
+
+# 8. 拦截 Ping0 娱乐库（HTTP）
+- name: block ping0 http
+  action: block
+  log: true
+  expr: string(http?.req?.headers?.host) endsWith "ping0.cc"
+
+# 9. 拦截 Ping0 娱乐库（HTTPS）
+- name: block ping0 https
+  action: block
+  log: true
+  expr: string(tls?.req?.sni) endsWith "ping0.cc"
+
+# 10. 拦截 Ping0 娱乐库（QUIC）
+- name: block ping0 quic
+  action: block
+  log: true
+  expr: string(quic?.req?.sni) endsWith "ping0.cc"
+
+# ============================================
+# 其他高危协议
+# ============================================
+
+# 11. SSH Tunnel（可选，谨慎启用）
+# - name: block ssh tunnel
+#   action: block
+#   log: true
+#   expr: ssh != nil && ssh.yes
+
+# 12. DNS over HTTPS (DoH)（可选）
+# - name: block doh
+#   action: block
+#   log: true
+#   expr: tls != nil && tls.req != nil && string(tls.req.sni) in ["dns.google", "cloudflare-dns.com", "dns.quad9.net"]
+
+# ============================================
+# 地域限制示例（仅作参考）
+# ============================================
+
+# 13. 只拦截来自中国大陆的 Shadowsocks
+# - name: block shadowsocks from china
+#   action: block
+#   log: true
+#   expr: fet != nil && fet.yes && geoip(string(ip.src), "cn")
+
+# ============================================
+# 白名单示例（允许特定流量）
+# ============================================
+
+# 14. 允许来自特定 IP 的所有流量
+# - name: allow trusted ip
+#   action: allow
+#   expr: string(ip.src) == "192.168.1.100"
+
+# 15. 允许访问特定域名
+# - name: allow example domain
+#   action: allow
+#   expr: string(tls?.req?.sni) == "example.com"
+

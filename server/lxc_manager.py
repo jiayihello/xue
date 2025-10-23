@@ -347,6 +347,17 @@ class LXCManager:
                         except Exception:
                             pass
 
+            # 获取网络模式配置
+            ipv4_mode = getattr(app_config, 'ipv4_mode', 'BRIDGE').upper()
+            ipv6_mode = getattr(app_config, 'ipv6_mode', 'OFF').upper()
+            
+            # 根据 IPv4 模式决定是否返回 PublicIPv4
+            # IPv6-Only 模式（IPV4_MODE=OFF）下不返回误导性的服务器 IP
+            if ipv4_mode == 'OFF':
+                public_ipv4 = None  # IPv6-Only 模式，无 IPv4
+            else:
+                public_ipv4 = app_config.nat_listen_ip  # 传统模式，返回 NAT IP
+            
             data = {
                 'Hostname': hostname, 'Status': lxc_status,
                 'UsedCPU': cpu_percent,
@@ -355,9 +366,10 @@ class LXCManager:
                 'TotalDisk': total_disk_mb, 'UsedDisk': used_disk_mb,
                 'IP': self._get_container_ip(container) or 'N/A',
                 'IPv6List': public_ipv6,
-                'PublicIPv4': app_config.nat_listen_ip,
-                'IPv6Mode': getattr(app_config, 'ipv6_mode', 'OFF'),
-                'PublicIPv6NAT': (str(getattr(app_config, 'nat_listen_ipv6', '')).split('/')[0] if getattr(app_config, 'ipv6_mode', 'OFF') == 'NAT66' and getattr(app_config, 'nat_listen_ipv6', None) else ''),
+                'PublicIPv4': public_ipv4,  # 修改：IPv6-Only 模式下返回 None
+                'IPv4Mode': ipv4_mode,  # 新增：返回 IPv4 模式（BRIDGE 或 OFF）
+                'IPv6Mode': ipv6_mode,  # 修改：使用变量
+                'PublicIPv6NAT': (str(getattr(app_config, 'nat_listen_ipv6', '')).split('/')[0] if ipv6_mode == 'NAT66' and getattr(app_config, 'nat_listen_ipv6', None) else ''),
                 'PublicSSHPort': (lambda: (next((str(r.get('dport')) for r in _load_iptables_rules_metadata() if r.get('hostname') == hostname and r.get('dtype','').lower()=='tcp' and str(r.get('sport'))=='22'), None)) or (next((d.get('listen','').split(':')[2] for name,d in container.devices.items() if d.get('type')=='proxy' and name.startswith('nat-') and d.get('connect','').endswith(':22')), None)) )(),
                 'Bandwidth': flow_limit_gb,
                 'UseBandwidth': used_flow_gb, # For lxdserver module
@@ -465,12 +477,21 @@ class LXCManager:
                 'root': {
                     'path': '/', 'pool': app_config.storage_pool,
                     'size': f"{params.get('disk', '1024')}MB", 'type': 'disk'
-                },
-                'eth0': {
-                    'name': 'eth0', 'network': app_config.network_bridge, 'type': 'nic'
                 }
             }
         }
+        
+        # 根据 IPV4_MODE 配置决定是否添加 IPv4 网卡
+        ipv4_mode = getattr(app_config, 'ipv4_mode', 'BRIDGE').upper()
+        if ipv4_mode == 'BRIDGE':
+            # 默认模式：添加 eth0 连接到网桥（NAT IPv4）
+            container_config_obj['devices']['eth0'] = {
+                'name': 'eth0', 'network': app_config.network_bridge, 'type': 'nic'
+            }
+            logger.info(f"容器 {hostname} 将配置 IPv4 网卡（BRIDGE 模式）")
+        elif ipv4_mode == 'OFF':
+            # IPv6-Only 模式：不添加 eth0
+            logger.info(f"容器 {hostname} 不配置 IPv4 网卡（IPV4_MODE=OFF）")
         
         # CPU 使用率百分比限制（可选）
         if params.get('cpu_percent'):
@@ -482,10 +503,15 @@ class LXCManager:
             except (ValueError, TypeError) as e:
                 logger.warning(f"无效的 CPU 百分比参数: {params.get('cpu_percent')}, 错误: {e}")
 
-        if params.get('up') and params.get('down'):
+        # 带宽限制（仅在 IPv4 BRIDGE 模式下有效）
+        if params.get('up') and params.get('down') and ipv4_mode == 'BRIDGE':
             # 修复：正确的Mbps到bit/s转换 (1 Mbps = 1,000,000 bit/s)
-            container_config_obj['devices']['eth0']['limits.ingress'] = f"{int(params.get('up'))*1000000}"
-            container_config_obj['devices']['eth0']['limits.egress'] = f"{int(params.get('down'))*1000000}"
+            if 'eth0' in container_config_obj['devices']:
+                container_config_obj['devices']['eth0']['limits.ingress'] = f"{int(params.get('up'))*1000000}"
+                container_config_obj['devices']['eth0']['limits.egress'] = f"{int(params.get('down'))*1000000}"
+                logger.info(f"容器 {hostname} 设置带宽限制: 上行 {params.get('up')}Mbps, 下行 {params.get('down')}Mbps")
+        elif params.get('up') and params.get('down') and ipv4_mode == 'OFF':
+            logger.warning(f"容器 {hostname} 处于 IPv6-Only 模式，带宽限制参数将被忽略")
 
         container_to_cleanup_on_error = None
         try:

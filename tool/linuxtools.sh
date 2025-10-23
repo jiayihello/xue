@@ -1407,6 +1407,271 @@ deploy_lxd_server() {
     cd "$script_dir" || true
 }
 
+deploy_opengfw() {
+    clear_screen
+    msg_info "--- OpenGFW 深度包检测防火墙部署 ---"
+    echo ""
+    
+    # 获取脚本所在目录
+    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local opengfw_dir="$script_dir/../server/opengfw"
+    local deploy_script="$opengfw_dir/deploy_opengfw.sh"
+    
+    # 检查 opengfw 目录是否存在
+    if [[ ! -d "$opengfw_dir" ]]; then
+        msg_error "未找到 opengfw 目录: $opengfw_dir"
+        echo ""
+        msg_info "请确保项目结构如下："
+        echo "  项目根目录/"
+        echo "    ├── LinuxTools-main/"
+        echo "    │   └── linuxtools.sh (当前脚本)"
+        echo "    └── server/"
+        echo "        └── opengfw/"
+        echo "            └── deploy_opengfw.sh"
+        return 1
+    fi
+    
+    # 检查部署脚本是否存在
+    if [[ ! -f "$deploy_script" ]]; then
+        msg_error "未找到部署脚本: $deploy_script"
+        return 1
+    fi
+    
+    # 显示说明
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo -e "${COLOR_CYAN}  OpenGFW 防火墙部署${COLOR_NC}"
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo ""
+    msg_info "OpenGFW 是什么？"
+    echo "  ✓ 深度包检测 (DPI) 工具"
+    echo "  ✓ 可拦截代理协议（Shadowsocks、Trojan、Socks 等）"
+    echo "  ✓ 可拦截 VPN 协议（WireGuard）"
+    echo "  ✓ 可拦截 BT 下载"
+    echo "  ✓ 支持基于地域的智能拦截"
+    echo ""
+    msg_info "适用场景："
+    echo "  🔹 LXD 容器服务器的流量管控"
+    echo "  🔹 防止滥用（代理转发、BT 下载等）"
+    echo "  🔹 合规性管理"
+    echo ""
+    msg_warn "⚠️  重要提示："
+    echo "  • OpenGFW 会分析所有经过宿主机的流量"
+    echo "  • 仅影响 LXD 容器流量，不影响宿主机本身"
+    echo "  • 部署前请确保了解法律法规要求"
+    echo ""
+    msg_info "此脚本将自动完成："
+    echo "  1. 检测系统架构 (AMD64/ARM64)"
+    echo "  2. 下载 OpenGFW v0.4.1"
+    echo "  3. 下载 GeoIP 数据库"
+    echo "  4. 配置 iptables 规则"
+    echo "  5. 创建 systemd 服务"
+    echo "  6. 交互式选择拦截策略"
+    echo ""
+    msg_warn "预计时间: 3-5 分钟"
+    echo ""
+    
+    # 询问确认
+    echo -e "${COLOR_YELLOW}========================================${COLOR_NC}"
+    echo -e "${COLOR_YELLOW}  ⚠️  请仔细阅读上述说明${COLOR_NC}"
+    echo -e "${COLOR_YELLOW}========================================${COLOR_NC}"
+    echo ""
+    read -p "$(echo -e "${COLOR_YELLOW}是否开始部署 OpenGFW? [y/N]: ${COLOR_NC}")" confirm
+    if [[ ! "${confirm}" =~ ^[yY]$ ]]; then
+        msg_info "操作已由用户取消。"
+        return
+    fi
+    
+    echo ""
+    msg_info "开始部署 OpenGFW..."
+    echo ""
+    
+    # 添加执行权限
+    chmod +x "$deploy_script"
+    
+    # 切换到 opengfw 目录并执行部署脚本
+    cd "$opengfw_dir" || {
+        msg_error "无法进入 opengfw 目录"
+        return 1
+    }
+    
+    # 执行部署脚本（直接运行，会有交互式选项）
+    if bash deploy_opengfw.sh; then
+        echo ""
+        echo ""
+        msg_ok "==============================================="
+        msg_ok "✓ OpenGFW 部署流程已完成！"
+        msg_ok "==============================================="
+        echo ""
+        
+        # 自动复制管理脚本到 /etc/opengfw/
+        msg_info "正在安装管理脚本..."
+        if [[ -f "$opengfw_dir/manage_opengfw.sh" ]]; then
+            if cp "$opengfw_dir/manage_opengfw.sh" /etc/opengfw/manage_opengfw.sh 2>/dev/null; then
+                chmod +x /etc/opengfw/manage_opengfw.sh
+                msg_ok "✓ 管理脚本已安装到 /etc/opengfw/manage_opengfw.sh"
+            else
+                msg_warn "⚠️  管理脚本复制失败，请手动复制"
+            fi
+        else
+            msg_warn "⚠️  未找到管理脚本: $opengfw_dir/manage_opengfw.sh"
+        fi
+        echo ""
+        
+        # 检查服务状态
+        msg_info "正在检查服务状态..."
+        sleep 1
+        
+        if systemctl is-active --quiet opengfw.service; then
+            msg_ok "✓ OpenGFW 服务运行正常"
+            echo ""
+            
+            msg_info "服务信息："
+            systemctl status opengfw.service --no-pager -l | head -10
+            echo ""
+        else
+            msg_warn "⚠️  服务未运行，请检查日志"
+            echo ""
+        fi
+        
+        msg_info "常用管理命令："
+        echo "  图形化管理:     bash /etc/opengfw/manage_opengfw.sh"
+        echo "  查看服务状态:   systemctl status opengfw"
+        echo "  查看实时日志:   journalctl -u opengfw -f"
+        echo "  查看拦截日志:   journalctl -u opengfw -f | grep 'block'"
+        echo "  重启服务:       systemctl restart opengfw"
+        echo "  停止服务:       systemctl stop opengfw"
+        echo "  编辑规则:       nano /etc/opengfw/rules.yaml"
+        echo "  编辑配置:       nano /etc/opengfw/config.yaml"
+        echo ""
+        
+        msg_info "配置文件位置："
+        echo "  主配置:   /etc/opengfw/config.yaml"
+        echo "  规则文件: /etc/opengfw/rules.yaml"
+        echo "  GeoIP:    /etc/opengfw/geoip.dat"
+        echo "  管理脚本: /etc/opengfw/manage_opengfw.sh"
+        echo "  卸载脚本: /etc/opengfw/uninstall.sh"
+        echo ""
+        
+        msg_ok "提示：您也可以在主菜单选择 '14) 管理 OpenGFW' 来使用图形化管理界面"
+        echo ""
+        
+    else
+        echo ""
+        msg_error "部署失败，请查看上面的错误信息"
+        echo ""
+        msg_info "故障排查："
+        echo "  1. 检查网络连接（需下载 GitHub 文件）"
+        echo "  2. 确认 iptables 工作正常"
+        echo "  3. 查看详细错误日志"
+        echo ""
+        msg_info "手动排查命令："
+        echo "  检查 iptables: iptables -L -n -v"
+        echo "  检查网络:      curl -I https://github.com"
+        echo "  查看日志:      journalctl -xe"
+        echo ""
+        return 1
+    fi
+    
+    # 返回原目录
+    cd "$script_dir" || true
+}
+
+manage_opengfw() {
+    clear_screen
+    msg_info "--- OpenGFW 图形化管理界面 ---"
+    echo ""
+    
+    # 检查 OpenGFW 服务是否存在
+    if ! systemctl list-unit-files | grep -q "opengfw.service"; then
+        msg_error "OpenGFW 服务未安装"
+        echo ""
+        msg_info "请先部署 OpenGFW："
+        echo "  1. 返回主菜单"
+        echo "  2. 选择 '13) 部署 OpenGFW 防火墙'"
+        echo ""
+        return 1
+    fi
+    
+    # 检查管理脚本是否存在
+    local manage_script="/etc/opengfw/manage_opengfw.sh"
+    
+    if [[ ! -f "$manage_script" ]]; then
+        msg_warn "管理脚本未找到: $manage_script"
+        echo ""
+        msg_info "正在尝试从工具集复制..."
+        
+        # 尝试从工具集目录复制
+        local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        local source_script="$script_dir/../server/opengfw/manage_opengfw.sh"
+        
+        if [[ -f "$source_script" ]]; then
+            if cp "$source_script" "$manage_script" 2>/dev/null; then
+                chmod +x "$manage_script"
+                msg_ok "✓ 管理脚本已安装"
+                echo ""
+            else
+                msg_error "复制失败，请手动安装管理脚本："
+                echo "  cp $source_script $manage_script"
+                echo "  chmod +x $manage_script"
+                return 1
+            fi
+        else
+            msg_error "源脚本也不存在: $source_script"
+            echo ""
+            msg_info "请确保工具集完整，或手动上传管理脚本"
+            return 1
+        fi
+    fi
+    
+    # 显示当前状态
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo -e "${COLOR_CYAN}  当前状态${COLOR_NC}"
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo ""
+    
+    # 检查服务状态
+    if systemctl is-active --quiet opengfw.service; then
+        msg_ok "服务状态: ✓ 运行中"
+    else
+        msg_error "服务状态: ✗ 已停止"
+    fi
+    
+    # 显示配置信息
+    if [[ -f /etc/opengfw/rules.yaml ]]; then
+        local rule_count=$(grep -c "^- name:" /etc/opengfw/rules.yaml 2>/dev/null || echo "0")
+        msg_info "规则数量: $rule_count 条"
+    fi
+    
+    echo ""
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo ""
+    
+    # 询问是否启动管理界面
+    read -p "$(echo -e "${COLOR_YELLOW}是否启动图形化管理界面? [Y/n]: ${COLOR_NC}")" confirm
+    if [[ "${confirm}" =~ ^[nN]$ ]]; then
+        msg_info "操作已取消"
+        return
+    fi
+    
+    echo ""
+    msg_info "正在启动管理界面..."
+    echo ""
+    sleep 1
+    
+    # 运行管理脚本
+    if bash "$manage_script"; then
+        echo ""
+        msg_ok "管理界面已退出"
+    else
+        echo ""
+        msg_error "管理脚本执行出错"
+        echo ""
+        msg_info "您也可以直接运行："
+        echo "  bash $manage_script"
+        return 1
+    fi
+}
+
 # ========================================
 # 完整卸载工具集
 # ========================================
@@ -1703,6 +1968,10 @@ show_main_menu() {
     echo -e "${COLOR_CYAN}--- 服务器部署 ---${COLOR_NC}"
     echo " 12) 部署 LXD 服务器后端 (一键部署)"
     echo ""
+    echo -e "${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
+    echo " 13) 部署 OpenGFW 防火墙 (DPI 深度包检测)"
+    echo " 14) 管理 OpenGFW (图形化管理界面)"
+    echo ""
     echo "  ---------------------------------------"
     echo -e "  ${COLOR_RED}0) 退出脚本${COLOR_NC}"
     echo -e "${COLOR_GREEN}=========================================${COLOR_NC}"
@@ -1751,6 +2020,8 @@ main() {
             10) create_swap_file ;;
             11) remove_swap_file ;;
             12) deploy_lxd_server ;;
+            13) deploy_opengfw ;;
+            14) manage_opengfw ;;
             0) 
             msg_info "感谢使用，再见！"
             exit 0
