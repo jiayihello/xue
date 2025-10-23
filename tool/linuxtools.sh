@@ -1581,8 +1581,10 @@ manage_opengfw() {
     msg_info "--- OpenGFW 图形化管理界面 ---"
     echo ""
     
-    # 检查 OpenGFW 服务是否存在
-    if ! systemctl list-unit-files | grep -q "opengfw.service"; then
+    # 检查 OpenGFW 服务是否存在（使用更可靠的检测方法）
+    if ! systemctl list-unit-files opengfw.service &>/dev/null && \
+       ! systemctl status opengfw &>/dev/null && \
+       ! [ -f /etc/systemd/system/opengfw.service ]; then
         msg_error "OpenGFW 服务未安装"
         echo ""
         msg_info "请先部署 OpenGFW："
@@ -1646,15 +1648,8 @@ manage_opengfw() {
     echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
     echo ""
     
-    # 询问是否启动管理界面
-    read -p "$(echo -e "${COLOR_YELLOW}是否启动图形化管理界面? [Y/n]: ${COLOR_NC}")" confirm
-    if [[ "${confirm}" =~ ^[nN]$ ]]; then
-        msg_info "操作已取消"
-        return
-    fi
-    
-    echo ""
-    msg_info "正在启动管理界面..."
+    # 直接启动管理界面，不再询问确认
+    msg_info "正在启动图形化管理界面..."
     echo ""
     sleep 1
     
