@@ -95,13 +95,13 @@ configure_snap_path() {
     # 确保 /snap 目录存在并正确链接（Debian 特别需要）
     if [[ ! -d /snap ]] && [[ -d /var/lib/snapd/snap ]]; then
         msg_info "创建 /snap 符号链接（Debian 系统需要）..."
-        sudo ln -sf /var/lib/snapd/snap /snap
+        ln -sf /var/lib/snapd/snap /snap
         msg_ok "✓ /snap 符号链接已创建"
     fi
     
     # 配置 PATH
     if [[ ":$PATH:" != *":/snap/bin:"* ]]; then
-        echo 'export PATH=$PATH:/snap/bin' | sudo tee -a /etc/profile.d/snap_path.sh >/dev/null
+        echo 'export PATH=$PATH:/snap/bin' | tee -a /etc/profile.d/snap_path.sh >/dev/null
         export PATH=$PATH:/snap/bin
         msg_ok "✓ Snap 路径已添加到系统 PATH"
     else
@@ -118,12 +118,12 @@ configure_snap_path() {
 
     # 创建符号链接
     if [ -x /snap/bin/lxd ] && [ ! -x /usr/local/bin/lxd ]; then
-        sudo ln -sf /snap/bin/lxd /usr/local/bin/lxd
+        ln -sf /snap/bin/lxd /usr/local/bin/lxd
         msg_ok "✓ 创建 lxd 符号链接"
     fi
 
     if [ -x /snap/bin/lxc ] && [ ! -x /usr/local/bin/lxc ]; then
-        sudo ln -sf /snap/bin/lxc /usr/local/bin/lxc
+        ln -sf /snap/bin/lxc /usr/local/bin/lxc
         msg_ok "✓ 创建 lxc 符号链接"
     fi
 
@@ -137,7 +137,7 @@ initialize_lxd() {
     local max_retries=10
 
     while [ $retry_count -lt $max_retries ]; do
-        if sudo snap services lxd | grep -q "active"; then
+        if snap services lxd | grep -q "active"; then
             msg_ok "✓ LXD snap 服务已启动"
             break
         fi
@@ -159,10 +159,10 @@ initialize_lxd() {
     fi
 
     msg_info "正在执行 lxd init --auto..."
-    if sudo "$lxd_cmd" init --auto; then
+    if "$lxd_cmd" init --auto; then
         msg_ok "✓ LXD 初始化成功"
         local lxd_version
-        lxd_version=$(sudo "$lxd_cmd" --version 2>/dev/null || echo "未知版本")
+        lxd_version=$("$lxd_cmd" --version 2>/dev/null || echo "未知版本")
         msg_ok "✓ LXD 版本: $lxd_version"
     else
         msg_error "✗ LXD 初始化失败"
@@ -257,7 +257,7 @@ install_lxd() {
         read -p "$(msg_warn "是否要强制重新进行自动化配置 (lxd init --auto)? [y/N]: ")" re_init
         if [[ "${re_init}" =~ ^[yY]$ ]]; then
             msg_warn "正在重新运行 lxd init --auto..."
-            if sudo lxd init --auto; then
+            if lxd init --auto; then
                 msg_ok "LXD 重新初始化成功。"
             else
                 msg_error "LXD 重新初始化失败，请检查上面的错误信息。"
@@ -300,23 +300,23 @@ install_lxd() {
     if [[ "$is_debian" == true ]]; then
         msg_info "检测到 Debian $debian_version，将使用 Debian 优化的安装流程"
         steps=(
-            "更新软件包列表;sudo apt-get update -y"
-            "安装 snapd;sudo apt-get install -y snapd"
-            "启用 snapd 服务;sudo systemctl enable --now snapd"
-            "启用 snapd.socket;sudo systemctl enable --now snapd.socket"
+            "更新软件包列表;apt-get update -y"
+            "安装 snapd;apt-get install -y snapd"
+            "启用 snapd 服务;systemctl enable --now snapd"
+            "启用 snapd.socket;systemctl enable --now snapd.socket"
             "等待 snapd 启动;sleep 5"
-            "创建 snap 符号链接;sudo ln -sf /var/lib/snapd/snap /snap 2>/dev/null || true"
-            "安装 snap core;sudo snap install core"
-            "通过 Snap 安装 LXD;sudo snap install lxd"
+            "创建 snap 符号链接;ln -sf /var/lib/snapd/snap /snap 2>/dev/null || true"
+            "安装 snap core;snap install core"
+            "通过 Snap 安装 LXD;snap install lxd"
             "配置 Snap 路径;configure_snap_path"
             "初始化 LXD;initialize_lxd"
         )
     else
         steps=(
-            "更新软件包列表;sudo apt-get update -y"
-            "安装 snapd;sudo apt-get install -y snapd"
-            "安装 snap core;sudo snap install core"
-            "通过 Snap 安装 LXD;sudo snap install lxd"
+            "更新软件包列表;apt-get update -y"
+            "安装 snapd;apt-get install -y snapd"
+            "安装 snap core;snap install core"
+            "通过 Snap 安装 LXD;snap install lxd"
             "配置 Snap 路径;configure_snap_path"
             "初始化 LXD;initialize_lxd"
         )
