@@ -775,6 +775,253 @@ list_images() {
     lxc image list
 }
 
+download_prebuilt_images() {
+    clear_screen
+    echo -e "${COLOR_GREEN}========================================="
+    echo -e "    下载预构建 LXD 镜像"
+    echo -e "=========================================${COLOR_NC}"
+    echo ""
+    
+    # 检测系统架构
+    local arch
+    arch=$(uname -m)
+    local lxd_arch
+    
+    case "$arch" in
+        x86_64)
+            lxd_arch="amd64"
+            msg_ok "✓ 检测到系统架构: x86_64 (AMD64)"
+            ;;
+        aarch64|arm64)
+            lxd_arch="arm64"
+            msg_ok "✓ 检测到系统架构: ARM64"
+            ;;
+        *)
+            msg_error "不支持的系统架构: $arch"
+            msg_error "目前仅支持 x86_64 (amd64) 和 aarch64 (arm64)"
+            return 1
+            ;;
+    esac
+    echo ""
+    
+    # GitHub 仓库信息
+    local github_repo="jiayihello/lxc-images"
+    local github_tag="lxc"
+    local github_base_url="https://github.com/${github_repo}/releases/download/${github_tag}"
+    
+    # 定义可用镜像（与 GitHub Releases 实际上传的镜像保持一致）
+    declare -A available_images=(
+        ["1"]="debian11:Debian 11 (bullseye)"
+        ["2"]="debian12:Debian 12 (bookworm)"
+        ["3"]="debian13:Debian 13 (trixie)"
+        ["4"]="ubuntu2204:Ubuntu 22.04 (jammy)"
+        ["5"]="ubuntu2410:Ubuntu 24.10 (oracular)"
+        ["6"]="alpine319:Alpine 3.19"
+        ["7"]="alpine322:Alpine 3.22"
+    )
+    
+    # 显示可用镜像
+    echo -e "${COLOR_CYAN}可下载的预构建镜像 (${lxd_arch}):${COLOR_NC}"
+    echo ""
+    echo -e "${COLOR_CYAN}--- Debian 系列 ---${COLOR_NC}"
+    for key in 1 2 3; do
+        IFS=':' read -r name desc <<< "${available_images[$key]}"
+        printf "  %2s) %-30s -> %s\n" "$key" "$desc" "$name"
+    done
+    echo ""
+    
+    echo -e "${COLOR_CYAN}--- Ubuntu 系列 ---${COLOR_NC}"
+    for key in 4 5; do
+        IFS=':' read -r name desc <<< "${available_images[$key]}"
+        printf "  %2s) %-30s -> %s\n" "$key" "$desc" "$name"
+    done
+    echo ""
+    
+    echo -e "${COLOR_CYAN}--- Alpine 系列 ---${COLOR_NC}"
+    for key in 6 7; do
+        IFS=':' read -r name desc <<< "${available_images[$key]}"
+        printf "  %2s) %-30s -> %s\n" "$key" "$desc" "$name"
+    done
+    echo ""
+    
+    read -p "输入选择（多选用空格分隔）或 0 返回: " user_choice
+    
+    if [[ "$user_choice" == "0" ]] || [[ -z "$user_choice" ]]; then
+        msg_info "操作已取消"
+        return 0
+    fi
+    
+    # 解析用户选择
+    declare -a selected_images
+    for choice in $user_choice; do
+        if [[ -n "${available_images[$choice]:-}" ]]; then
+            IFS=':' read -r name desc <<< "${available_images[$choice]}"
+            selected_images+=("$name")
+        else
+            msg_warn "无效选项: $choice，已跳过"
+        fi
+    done
+    
+    if [[ ${#selected_images[@]} -eq 0 ]]; then
+        msg_error "没有有效的镜像选择"
+        return 1
+    fi
+    
+    # 创建临时下载目录
+    local temp_dir="/tmp/lxd-image-downloads-$$"
+    mkdir -p "$temp_dir"
+    msg_info "临时下载目录: $temp_dir"
+    echo ""
+    
+    # 开始下载和导入
+    local success_count=0
+    local fail_count=0
+    local skip_count=0
+    
+    for image_name in "${selected_images[@]}"; do
+        echo -e "${COLOR_GREEN}----------------------------------------${COLOR_NC}"
+        msg_info "处理镜像: $image_name (${lxd_arch})"
+        
+        # 检查镜像是否已存在
+        if lxc image list | grep -q "$image_name"; then
+            msg_warn "✓ 镜像 '$image_name' 已存在，跳过下载"
+            ((skip_count++))
+            continue
+        fi
+        
+        # 构建下载URL（标准格式：imagename-arch.tar.gz）
+        local filename="${image_name}-${lxd_arch}.tar.gz"
+        local download_url="${github_base_url}/${filename}"
+        local local_file="${temp_dir}/${filename}"
+        
+        # 下载镜像
+        msg_info "正在下载: ${filename}"
+        msg_info "下载地址: ${download_url}"
+        
+        if command -v wget &>/dev/null; then
+            if wget -q --show-progress -O "$local_file" "$download_url" 2>&1; then
+                msg_ok "✓ 下载成功"
+            else
+                msg_error "✗ 下载失败: $filename"
+                ((fail_count++))
+                continue
+            fi
+        elif command -v curl &>/dev/null; then
+            if curl -L -# -o "$local_file" "$download_url" 2>&1; then
+                msg_ok "✓ 下载成功"
+            else
+                msg_error "✗ 下载失败: $filename"
+                ((fail_count++))
+                continue
+            fi
+        else
+            msg_error "未找到 wget 或 curl 工具"
+            msg_error "请先安装: apt-get install wget 或 apt-get install curl"
+            break
+        fi
+        
+        # 验证下载的文件
+        if [[ ! -f "$local_file" ]]; then
+            msg_error "✗ 下载文件不存在: $local_file"
+            ((fail_count++))
+            continue
+        fi
+        
+        local file_size
+        file_size=$(du -h "$local_file" | cut -f1)
+        msg_info "文件大小: $file_size"
+        
+        # 导入镜像
+        msg_info "正在导入镜像..."
+        
+        # 提取 tar.gz 中的 rootfs 和 metadata 文件
+        # LXD 镜像通常包含两个文件：rootfs.tar.xz 和 lxd.tar.xz（或类似结构）
+        local extract_dir="${temp_dir}/${image_name}-extract"
+        mkdir -p "$extract_dir"
+        
+        if tar -xzf "$local_file" -C "$extract_dir" 2>&1; then
+            msg_ok "✓ 解压成功"
+            
+            # 查找 rootfs 和 metadata 文件
+            local rootfs_file
+            local metadata_file
+            
+            # 常见的文件模式
+            rootfs_file=$(find "$extract_dir" -name "rootfs.tar*" -o -name "*.rootfs.tar*" | head -n1)
+            metadata_file=$(find "$extract_dir" -name "lxd.tar*" -o -name "*.lxd.tar*" -o -name "meta*.tar*" | head -n1)
+            
+            if [[ -z "$rootfs_file" ]]; then
+                msg_warn "未找到标准的 rootfs 文件，尝试直接导入完整 tar.gz"
+                # 直接使用完整的 tar.gz 文件导入
+                if lxc image import "$local_file" --alias "$image_name" 2>&1; then
+                    msg_ok "✓ 镜像导入成功: $image_name"
+                    ((success_count++))
+                else
+                    msg_error "✗ 镜像导入失败: $image_name"
+                    ((fail_count++))
+                fi
+            else
+                # 使用 rootfs 和 metadata 导入
+                if [[ -n "$metadata_file" ]]; then
+                    msg_info "使用 rootfs 和 metadata 导入"
+                    if lxc image import "$metadata_file" "$rootfs_file" --alias "$image_name" 2>&1; then
+                        msg_ok "✓ 镜像导入成功: $image_name"
+                        ((success_count++))
+                    else
+                        msg_error "✗ 镜像导入失败: $image_name"
+                        ((fail_count++))
+                    fi
+                else
+                    msg_info "仅找到 rootfs，尝试单文件导入"
+                    if lxc image import "$rootfs_file" --alias "$image_name" 2>&1; then
+                        msg_ok "✓ 镜像导入成功: $image_name"
+                        ((success_count++))
+                    else
+                        msg_error "✗ 镜像导入失败: $image_name"
+                        ((fail_count++))
+                    fi
+                fi
+            fi
+            
+            # 清理解压目录
+            rm -rf "$extract_dir"
+        else
+            msg_error "✗ 解压失败: $filename"
+            ((fail_count++))
+        fi
+        
+        # 删除下载的文件
+        rm -f "$local_file"
+        msg_info "已清理下载文件"
+    done
+    
+    # 清理临时目录
+    rm -rf "$temp_dir"
+    msg_info "已清理临时目录"
+    
+    # 显示统计结果
+    echo ""
+    echo -e "${COLOR_GREEN}=========================================${COLOR_NC}"
+    msg_info "下载和导入完成！"
+    echo ""
+    msg_ok "✓ 成功: ${success_count} 个"
+    if [[ $skip_count -gt 0 ]]; then
+        msg_warn "○ 跳过: ${skip_count} 个（已存在）"
+    fi
+    if [[ $fail_count -gt 0 ]]; then
+        msg_error "✗ 失败: ${fail_count} 个"
+    fi
+    echo -e "${COLOR_GREEN}=========================================${COLOR_NC}"
+    echo ""
+    
+    # 显示当前镜像列表
+    if [[ $success_count -gt 0 ]]; then
+        msg_info "当前本地镜像列表:"
+        echo ""
+        lxc image list
+    fi
+}
+
 create_btrfs_pool_from_file() {
     clear_screen
     msg_info "--- 从镜像文件创建BTRFS存储池 ---"
@@ -2005,19 +2252,20 @@ show_main_menu() {
     echo "  5) 构建自定义镜像"
     echo "  6) 备份所有本地 LXD 镜像"
     echo "  7) 列出本地 LXD 镜像"
+    echo "  8) 下载预构建镜像 (从 GitHub)"
     echo ""
     echo -e "${COLOR_CYAN}--- 虚拟内存管理 ---${COLOR_NC}"
-    echo "  8) 安装并配置 ZRAM (内存压缩, 推荐)"
-    echo "  9) 移除 ZRAM"
-    echo " 10) 添加/修改 Swap 文件 (基于硬盘)"
-    echo " 11) 移除 Swap 文件"
+    echo "  9) 安装并配置 ZRAM (内存压缩, 推荐)"
+    echo " 10) 移除 ZRAM"
+    echo " 11) 添加/修改 Swap 文件 (基于硬盘)"
+    echo " 12) 移除 Swap 文件"
     echo ""
     echo -e "${COLOR_CYAN}--- 服务器部署 ---${COLOR_NC}"
-    echo " 12) 部署 LXD 服务器后端 (一键部署)"
+    echo " 13) 部署 LXD 服务器后端 (一键部署)"
     echo ""
     echo -e "${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
-    echo " 13) 部署 OpenGFW 防火墙 (DPI 深度包检测)"
-    echo " 14) 管理 OpenGFW (图形化管理界面)"
+    echo " 14) 部署 OpenGFW 防火墙 (DPI 深度包检测)"
+    echo " 15) 管理 OpenGFW (图形化管理界面)"
     echo ""
     echo "  ---------------------------------------"
     echo -e "  ${COLOR_RED}0) 退出脚本${COLOR_NC}"
@@ -2062,13 +2310,20 @@ main() {
                     list_images
                 fi
                 ;;
-            8) configure_zram ;;
-            9) remove_zram ;;
-            10) create_swap_file ;;
-            11) remove_swap_file ;;
-            12) deploy_lxd_server ;;
-            13) deploy_opengfw ;;
-            14) manage_opengfw ;;
+            8) 
+                if ! is_lxd_installed; then
+                    msg_error "LXD 未安装，请先选择选项 3 安装 LXD。"
+                else
+                    download_prebuilt_images
+                fi
+                ;;
+            9) configure_zram ;;
+            10) remove_zram ;;
+            11) create_swap_file ;;
+            12) remove_swap_file ;;
+            13) deploy_lxd_server ;;
+            14) deploy_opengfw ;;
+            15) manage_opengfw ;;
             0) 
             msg_info "感谢使用，再见！"
             exit 0
