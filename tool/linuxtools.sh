@@ -2247,32 +2247,28 @@ show_main_menu() {
     echo -e "       LXD 工具箱（欢乐云）          "
     echo -e "=========================================${COLOR_NC}"
     echo ""
-    echo -e "${COLOR_CYAN}--- 工具管理 ---${COLOR_NC}"
-    echo "  1) 下载完整工具集到本地"
-    echo "  2) 完整卸载工具集"
-    echo ""
     echo -e "${COLOR_CYAN}--- LXD 环境 ---${COLOR_NC}"
-    echo "  3) 安装或检查 LXD 环境"
-    echo "  4) 存储池管理"
+    echo "  1) 安装或检查 LXD 环境"
+    echo "  2) 存储池管理"
     echo ""
     echo -e "${COLOR_CYAN}--- 镜像管理 ---${COLOR_NC}"
-    echo "  5) 构建自定义镜像"
-    echo "  6) 备份所有本地 LXD 镜像"
-    echo "  7) 列出本地 LXD 镜像"
-    echo "  8) 下载预构建镜像 (从 GitHub)"
+    echo "  3) 构建自定义镜像"
+    echo "  4) 备份所有本地 LXD 镜像"
+    echo "  5) 列出本地 LXD 镜像"
+    echo "  6) 下载预构建镜像 (从 GitHub)"
     echo ""
     echo -e "${COLOR_CYAN}--- 虚拟内存管理 ---${COLOR_NC}"
-    echo "  9) 安装并配置 ZRAM (内存压缩, 推荐)"
-    echo " 10) 移除 ZRAM"
-    echo " 11) 添加/修改 Swap 文件 (基于硬盘)"
-    echo " 12) 移除 Swap 文件"
+    echo "  7) 安装并配置 ZRAM (内存压缩, 推荐)"
+    echo "  8) 移除 ZRAM"
+    echo "  9) 添加/修改 Swap 文件 (基于硬盘)"
+    echo " 10) 移除 Swap 文件"
     echo ""
     echo -e "${COLOR_CYAN}--- 服务器部署 ---${COLOR_NC}"
-    echo " 13) 部署 LXD 服务器后端 (一键部署)"
+    echo " 11) 部署 LXD 服务器后端 (一键部署)"
     echo ""
     echo -e "${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
-    echo " 14) 部署 OpenGFW 防火墙 (DPI 深度包检测)"
-    echo " 15) 管理 OpenGFW (图形化管理界面)"
+    echo " 12) 部署 OpenGFW 防火墙 (DPI 深度包检测)"
+    echo " 13) 管理 OpenGFW (图形化管理界面)"
     echo ""
     echo "  ---------------------------------------"
     echo -e "  ${COLOR_RED}0) 退出脚本${COLOR_NC}"
@@ -2287,50 +2283,57 @@ show_main_menu() {
 main() {
     check_root
     check_dependencies
+    
+    # 自动下载完整工具集到本地（首次运行）
+    if [[ ! -d "$HOME/lxd-toolkit" ]]; then
+        msg_info "检测到首次运行，正在下载完整工具集..."
+        download_repository
+        echo ""
+        msg_ok "工具集下载完成，按任意键继续..."
+        read -n 1 -s -r
+    fi
 
     while true; do
         show_main_menu
         
         case "$choice" in
-            1) download_repository ;;
-            2) uninstall_toolkit ;;
-            3) install_lxd ;;
-            4) 
+            1) install_lxd ;;
+            2) 
                 if ! is_lxd_installed; then
-                    msg_error "LXD 未安装，请先选择选项 3 安装 LXD。"
+                    msg_error "LXD 未安装，请先选择选项 1 安装 LXD。"
                 else
                     manage_storage_pools
                 fi
                 ;;
-            5) build_custom_images ;;
-            6) 
+            3) build_custom_images ;;
+            4) 
                 if ! is_lxd_installed; then
-                    msg_error "LXD 未安装，请先选择选项 3 安装 LXD。"
+                    msg_error "LXD 未安装，请先选择选项 1 安装 LXD。"
                 else
                     backup_images
                 fi
                 ;;
-            7) 
+            5) 
                 if ! is_lxd_installed; then
-                    msg_error "LXD 未安装，请先选择选项 3 安装 LXD。"
+                    msg_error "LXD 未安装，请先选择选项 1 安装 LXD。"
                 else
                     list_images
                 fi
                 ;;
-            8) 
+            6) 
                 if ! is_lxd_installed; then
-                    msg_error "LXD 未安装，请先选择选项 3 安装 LXD。"
+                    msg_error "LXD 未安装，请先选择选项 1 安装 LXD。"
                 else
                     download_prebuilt_images
                 fi
                 ;;
-            9) configure_zram ;;
-            10) remove_zram ;;
-            11) create_swap_file ;;
-            12) remove_swap_file ;;
-            13) deploy_lxd_server ;;
-            14) deploy_opengfw ;;
-            15) manage_opengfw ;;
+            7) configure_zram ;;
+            8) remove_zram ;;
+            9) create_swap_file ;;
+            10) remove_swap_file ;;
+            11) deploy_lxd_server ;;
+            12) deploy_opengfw ;;
+            13) manage_opengfw ;;
             0) 
             msg_info "感谢使用，再见！"
             exit 0
