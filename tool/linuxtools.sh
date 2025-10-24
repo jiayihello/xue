@@ -882,17 +882,17 @@ download_prebuilt_images() {
         echo -e "${COLOR_GREEN}----------------------------------------${COLOR_NC}"
         msg_info "处理镜像: $image_name (${lxd_arch})"
         
+        # 构建下载URL（标准格式：imagename-arch.tar.gz）
+        local filename="${image_name}-${lxd_arch}.tar.gz"
+        local download_url="${github_base_url}/${filename}"
+        local local_file="${temp_dir}/${filename}"
+        
         # 检查镜像是否已存在
         if lxc image list | grep -q "$image_name"; then
             msg_warn "✓ 镜像 '$image_name' 已存在，跳过下载"
             ((skip_count++))
             continue
         fi
-        
-        # 构建下载URL（标准格式：imagename-arch.tar.gz）
-        local filename="${image_name}-${lxd_arch}.tar.gz"
-        local download_url="${github_base_url}/${filename}"
-        local local_file="${temp_dir}/${filename}"
         
         # 下载镜像
         msg_info "正在下载: ${filename}"
@@ -931,68 +931,75 @@ download_prebuilt_images() {
         file_size=$(du -h "$local_file" | cut -f1)
         msg_info "文件大小: $file_size"
         
-        # 导入镜像
+        # 导入镜像（直接导入压缩包，无需解压）
+        # 临时禁用 errexit，避免导入后的清理操作被中断
+        set +e
+        
         msg_info "正在导入镜像..."
         
-        # 提取 tar.gz 中的 rootfs 和 metadata 文件
-        # LXD 镜像通常包含两个文件：rootfs.tar.xz 和 lxd.tar.xz（或类似结构）
-        local extract_dir="${temp_dir}/${image_name}-extract"
-        mkdir -p "$extract_dir"
-        
-        if tar -xzf "$local_file" -C "$extract_dir" 2>&1; then
-            msg_ok "✓ 解压成功"
-            
-            # 查找 rootfs 和 metadata 文件
-            local rootfs_file
-            local metadata_file
-            
-            # 常见的文件模式
-            rootfs_file=$(find "$extract_dir" -name "rootfs.tar*" -o -name "*.rootfs.tar*" | head -n1)
-            metadata_file=$(find "$extract_dir" -name "lxd.tar*" -o -name "*.lxd.tar*" -o -name "meta*.tar*" | head -n1)
-            
-            if [[ -z "$rootfs_file" ]]; then
-                msg_warn "未找到标准的 rootfs 文件，尝试直接导入完整 tar.gz"
-                # 直接使用完整的 tar.gz 文件导入
-                if lxc image import "$local_file" --alias "$image_name" 2>&1; then
-                    msg_ok "✓ 镜像导入成功: $image_name"
-                    ((success_count++))
-                else
-                    msg_error "✗ 镜像导入失败: $image_name"
-                    ((fail_count++))
-                fi
-            else
-                # 使用 rootfs 和 metadata 导入
-                if [[ -n "$metadata_file" ]]; then
-                    msg_info "使用 rootfs 和 metadata 导入"
-                    if lxc image import "$metadata_file" "$rootfs_file" --alias "$image_name" 2>&1; then
-                        msg_ok "✓ 镜像导入成功: $image_name"
-                        ((success_count++))
-                    else
-                        msg_error "✗ 镜像导入失败: $image_name"
-                        ((fail_count++))
-                    fi
-                else
-                    msg_info "仅找到 rootfs，尝试单文件导入"
-                    if lxc image import "$rootfs_file" --alias "$image_name" 2>&1; then
-                        msg_ok "✓ 镜像导入成功: $image_name"
-                        ((success_count++))
-                    else
-                        msg_error "✗ 镜像导入失败: $image_name"
-                        ((fail_count++))
-                    fi
-                fi
-            fi
-            
-            # 清理解压目录
-            rm -rf "$extract_dir"
+        # 方法1：先尝试直接导入 tar.gz（统一格式镜像）
+        if lxc image import "$local_file" --alias "$image_name" >/dev/null 2>&1; then
+            msg_ok "✓ 镜像导入成功: $image_name"
+            success_count=$((success_count + 1))
         else
-            msg_error "✗ 解压失败: $filename"
-            ((fail_count++))
+            # 方法2：如果失败，尝试解压并查找分离的 metadata 和 rootfs 文件
+            msg_warn "直接导入失败，尝试分离格式..."
+            local extract_dir="${temp_dir}/${image_name}-extract"
+            mkdir -p "$extract_dir"
+            
+            if tar -xzf "$local_file" -C "$extract_dir" >/dev/null 2>&1; then
+                local metadata_file
+                local rootfs_file
+                
+                # 查找 metadata 和 rootfs 文件
+                metadata_file=$(find "$extract_dir" -name "lxd.tar*" -o -name "meta*.tar*" | head -n1)
+                rootfs_file=$(find "$extract_dir" -name "rootfs.tar*" -o -name "*.rootfs.tar*" | head -n1)
+                
+                if [[ -n "$metadata_file" ]] && [[ -n "$rootfs_file" ]]; then
+                    msg_info "使用分离格式导入（metadata + rootfs）"
+                    if lxc image import "$metadata_file" "$rootfs_file" --alias "$image_name" >/dev/null 2>&1; then
+                        msg_ok "✓ 镜像导入成功: $image_name"
+                        success_count=$((success_count + 1))
+                    else
+                        msg_error "✗ 镜像导入失败: $image_name"
+                        fail_count=$((fail_count + 1))
+                    fi
+                else
+                    msg_error "✗ 未找到有效的镜像文件（metadata 或 rootfs）"
+                    fail_count=$((fail_count + 1))
+                fi
+                
+                # 清理解压目录
+                rm -rf "$extract_dir"
+            else
+                msg_error "✗ 解压失败: $filename"
+                fail_count=$((fail_count + 1))
+            fi
         fi
         
-        # 删除下载的文件
-        rm -f "$local_file"
-        msg_info "已清理下载文件"
+        # 删除下载的文件（确保删除成功）
+        echo ""
+        msg_info "清理下载文件..."
+        if [[ -f "$local_file" ]]; then
+            msg_info "文件路径: $local_file"
+            if rm -f "$local_file"; then
+                msg_ok "✓ 已删除下载文件: $filename"
+            else
+                msg_warn "删除失败，尝试修改权限后重试..."
+                chmod 666 "$local_file" 2>/dev/null || true
+                if rm -f "$local_file"; then
+                    msg_ok "✓ 已删除下载文件: $filename"
+                else
+                    msg_error "✗ 无法删除文件: $local_file"
+                    msg_warn "请手动删除: rm -f '$local_file'"
+                fi
+            fi
+        else
+            msg_warn "文件不存在: $local_file"
+        fi
+        
+        # 恢复 errexit
+        set -e
     done
     
     # 清理临时目录
