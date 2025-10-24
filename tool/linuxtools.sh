@@ -406,11 +406,12 @@ build_custom_images() {
         fi
     fi
     
-    # 定义常用镜像（3个）
+    # 定义常用镜像（4个）
     declare -A common_images=(
-        ["1"]="debian:bookworm:debian12:Debian 12 (bookworm)"
-        ["2"]="debian:trixie:debian13:Debian 13 (trixie)"
-        ["3"]="alpine:3.22:alpine322:Alpine 3.22"
+        ["1"]="debian:bullseye:debian11:Debian 11 (bullseye)"
+        ["2"]="debian:bookworm:debian12:Debian 12 (bookworm)"
+        ["3"]="debian:trixie:debian13:Debian 13 (trixie)"
+        ["4"]="alpine:3.22:alpine322:Alpine 3.22"
     )
     
     # 定义所有镜像
@@ -435,13 +436,13 @@ build_custom_images() {
         printf "  %s) %-30s -> %s\n" "$key" "$desc" "$name"
     done
         echo ""
-    echo -e "${COLOR_CYAN}  4) 更多镜像选项...${COLOR_NC}"
+    echo -e "${COLOR_CYAN}  5) 更多镜像选项...${COLOR_NC}"
         echo ""
     
-    read -p "输入选择（多选用空格分隔，选 4 查看全部）: " user_choice
+    read -p "输入选择（多选用空格分隔，选 5 查看全部）: " user_choice
     
-    # 如果用户选择 4（更多选项），显示完整列表
-    if [[ "$user_choice" == *"4"* ]]; then
+    # 如果用户选择 5（更多选项），显示完整列表
+    if [[ "$user_choice" == *"5"* ]]; then
         clear_screen
         echo -e "${COLOR_GREEN}========================================="
         echo -e "    构建自定义 LXD 镜像 - 完整列表"
@@ -492,8 +493,8 @@ build_custom_images() {
     # 构建选择的镜像列表
     declare -a selected_images
     for choice in $user_choice; do
-        # 跳过"更多选项"的 4
-        if [[ "$choice" == "4" ]]; then
+        # 跳过"更多选项"的 5
+        if [[ "$choice" == "5" ]]; then
             continue
         fi
         

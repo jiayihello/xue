@@ -748,7 +748,9 @@ class LXCManager:
             # 预检查函数：通过 ss 检测是否已有监听（更健壮：处理 0.0.0.0/:: 与特定地址之间的冲突关系）
             def _port_occupied(ipv6: bool, ip: str, port: str, proto_s: str):
                 try:
-                    args = ['-ltnp']
+                    # 根据协议类型选择 ss 参数：TCP 用 -t，UDP 用 -u
+                    proto_flag = 't' if str(proto_s).lower() == 'tcp' else 'u'
+                    args = [f'-l{proto_flag}np']
                     if ipv6:
                         args.append('-6')
                     else:
