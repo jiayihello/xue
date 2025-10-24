@@ -45,11 +45,14 @@ def setup_network():
     """配置网络规则"""
     logger.info("开始设置网络规则...")
 
-    # 获取配置
+    # 获取配置（优先从环境变量读取，以支持部署时动态配置）
     try:
         network_bridge = app_config.network_bridge
-        main_interface = app_config.main_interface
+        # 优先从环境变量读取 MAIN_INTERFACE，如果不存在则从配置文件读取
+        main_interface = os.environ.get('MAIN_INTERFACE') or app_config.main_interface
         nat_listen_ip = app_config.nat_listen_ip
+        
+        logger.info(f"网络配置: bridge={network_bridge}, interface={main_interface}, nat_ip={nat_listen_ip}")
     except Exception as e:
         logger.error(f"读取配置文件失败: {str(e)}")
         return False

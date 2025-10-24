@@ -102,9 +102,74 @@ fi
 # ==========================================
 log_step "步骤 2-4/11: 网络配置"
 
-# 输入 IPv4 地址
+# 检测可用的网卡接口
+echo ""
+log_info "检测可用的网卡接口..."
+# 使用 set +e 临时关闭错误退出，避免 grep 无匹配时导致脚本退出
+set +e
+AVAILABLE_INTERFACES=$(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -v '^lo$' | grep -v '^lxdbr' || true)
+set -e
+
+if [ -n "$AVAILABLE_INTERFACES" ]; then
+    log_info "检测到以下网卡接口:"
+    echo "$AVAILABLE_INTERFACES" | head -10 | nl -w2 -s') '
+    echo ""
+else
+    log_warn "未自动检测到可用网卡，请手动输入"
+    echo ""
+fi
+
+# 输入主网卡接口名
+log_info "请输入主网卡接口名（常见: eth0, ens3, ens18, enp0s3）"
 while true; do
-    read -p "$(echo -e "${COLOR_YELLOW}请输入服务器的 IPv4 地址:${COLOR_NC} ")" IPV4_ADDRESS
+    read -p "$(echo -e "${COLOR_YELLOW}主网卡接口名:${COLOR_NC} ")" MAIN_INTERFACE
+    if [ -n "$MAIN_INTERFACE" ]; then
+        # 验证网卡是否存在
+        if ip link show "$MAIN_INTERFACE" >/dev/null 2>&1; then
+            log_ok "主网卡接口: $MAIN_INTERFACE ✓ (已验证存在)"
+            break
+        else
+            log_warn "警告: 网卡 '$MAIN_INTERFACE' 不存在于系统中"
+            read -p "$(echo -e "${COLOR_YELLOW}是否仍然使用此接口名? [y/N]:${COLOR_NC} ")" confirm
+            if [[ "$confirm" =~ ^[yY]$ ]]; then
+                log_ok "主网卡接口: $MAIN_INTERFACE (未验证)"
+                break
+            fi
+        fi
+    else
+        log_error "网卡接口名不能为空，请重新输入"
+    fi
+done
+
+# 输入 IPv4 地址
+echo ""
+log_info "检测服务器 IPv4 地址..."
+# 尝试自动检测 IPv4 地址
+set +e
+DETECTED_IPV4=""
+if [ -n "$MAIN_INTERFACE" ]; then
+    # 优先从指定网卡检测
+    DETECTED_IPV4=$(ip -4 addr show "$MAIN_INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+fi
+if [ -z "$DETECTED_IPV4" ]; then
+    # 从所有网卡检测（排除回环和Docker）
+    DETECTED_IPV4=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '^127\.' | grep -v '^172\.1[6-9]\.' | grep -v '^172\.2[0-9]\.' | grep -v '^172\.3[0-1]\.' | head -1 || true)
+fi
+set -e
+
+if [ -n "$DETECTED_IPV4" ]; then
+    log_info "检测到 IPv4 地址: $DETECTED_IPV4"
+    echo ""
+fi
+
+while true; do
+    if [ -n "$DETECTED_IPV4" ]; then
+        read -p "$(echo -e "${COLOR_YELLOW}请输入服务器的 IPv4 地址 [默认: $DETECTED_IPV4]:${COLOR_NC} ")" IPV4_ADDRESS
+        IPV4_ADDRESS=${IPV4_ADDRESS:-$DETECTED_IPV4}
+    else
+        read -p "$(echo -e "${COLOR_YELLOW}请输入服务器的 IPv4 地址:${COLOR_NC} ")" IPV4_ADDRESS
+    fi
+    
     if [[ "$IPV4_ADDRESS" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         log_ok "IPv4 地址: $IPV4_ADDRESS"
         break
@@ -154,6 +219,7 @@ done
 log_info "生成网络配置..."
 cat > network_config.env << EOF
 # 网络配置文件
+MAIN_INTERFACE=$MAIN_INTERFACE
 IPV4_ADDRESS=$IPV4_ADDRESS
 IPV6_MODE=$IPV6_MODE
 IPV6_PREFIX=$IPV6_PREFIX
@@ -164,7 +230,7 @@ echo ""
 log_info "执行网络配置脚本..."
 if [ -f "network_setup.py" ]; then
     # 设置环境变量供 Python 脚本使用
-    export IPV4_ADDRESS IPV6_MODE IPV6_PREFIX
+    export MAIN_INTERFACE IPV4_ADDRESS IPV6_MODE IPV6_PREFIX
     
     if python3 network_setup.py; then
         log_ok "网络配置完成"
@@ -364,6 +430,13 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     # 更新 app.ini 中的网络配置（无论是新建还是已存在）
     log_info "更新 app.ini 网络配置..."
     
+    # 更新 MAIN_INTERFACE
+    if grep -q "^MAIN_INTERFACE\s*=" app.ini; then
+        sed -i "s|^MAIN_INTERFACE\s*=.*|MAIN_INTERFACE = $MAIN_INTERFACE|g" app.ini
+    else
+        echo "MAIN_INTERFACE = $MAIN_INTERFACE" >> app.ini
+    fi
+    
     # 更新 NAT_LISTEN_IP
     if grep -q "^NAT_LISTEN_IP\s*=" app.ini; then
         sed -i "s|^NAT_LISTEN_IP\s*=.*|NAT_LISTEN_IP = $IPV4_ADDRESS|g" app.ini
@@ -390,6 +463,7 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     fi
     
     log_ok "✓ app.ini 网络配置已更新"
+    log_info "  MAIN_INTERFACE = $MAIN_INTERFACE"
     log_info "  NAT_LISTEN_IP = $IPV4_ADDRESS"
     if [ -n "$IPV6_MODE" ]; then
         log_info "  IPV6_MODE = $IPV6_MODE"
@@ -453,6 +527,7 @@ echo ""
 
 # 网络配置
 echo -e "${COLOR_CYAN}网络配置:${COLOR_NC}"
+echo "  主网卡接口: $MAIN_INTERFACE"
 echo "  IPv4: $IPV4_ADDRESS"
 echo "  IPv6 模式: $IPV6_MODE"
 if [ -n "$IPV6_PREFIX" ]; then
