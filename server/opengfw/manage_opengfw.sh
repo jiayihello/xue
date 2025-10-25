@@ -330,8 +330,8 @@ show_performance() {
     if command -v vnstat &> /dev/null; then
         vnstat -tr 10
     else
-        print_warning "未安装 vnstat，使用 ifconfig 代替"
-        ifconfig | grep -A 7 "^[a-z]" | grep -E "RX|TX"
+        print_warning "未安装 vnstat，使用 ip 命令代替"
+        ip -s link show | grep -E "^\s+RX|^\s+TX" | head -20
     fi
     
     echo ""
