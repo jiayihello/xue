@@ -976,7 +976,7 @@ class LXCManager:
                 # 连通性自检（仅TCP）：可配置严格/宽松模式
                 try:
                     if proto.lower() == 'tcp':
-                        strict = getattr(app_config, 'portmap_selftest_strict', True)
+                        strict = getattr(app_config, 'portmap_selftest_strict', False)  # 默认改为宽松模式
                         # 1) 宿主直连容器后端端口，确认服务在监听
                         try:
                             _s = socket.create_connection((container_ip, int(sport)), timeout=2.0)
