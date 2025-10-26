@@ -2536,7 +2536,7 @@ show_main_menu() {
     echo "                                         11) 添加/修改 Swap 文件"
     echo -e "${COLOR_CYAN}--- 镜像管理 ---${COLOR_NC}                         12) 移除 Swap 文件"
     echo "  3) 构建自定义镜像"
-    echo "  4) 备份所有本地 LXD 镜像              ${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
+    echo -e "  4) 备份所有本地 LXD 镜像              ${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
     echo "  5) 列出本地 LXD 镜像                  13) 部署 OpenGFW 防火墙"
     echo "  6) 下载预构建镜像                     14) 管理 OpenGFW"
     echo ""
