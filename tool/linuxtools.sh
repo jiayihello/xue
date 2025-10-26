@@ -2524,40 +2524,30 @@ EOF
 show_main_menu() {
     clear_screen
     show_swap_status
-    echo -e "${COLOR_GREEN}========================================="
-    echo -e "       LXD 工具箱（欢乐云）          "
-    echo -e "=========================================${COLOR_NC}"
+    echo -e "${COLOR_GREEN}========================================================================="
+    echo -e "                         LXD 工具箱（欢乐云）                            "
+    echo -e "=========================================================================${COLOR_NC}"
     echo ""
-    echo -e "${COLOR_CYAN}--- LXD 环境 ---${COLOR_NC}"
-    echo "  1) 安装或检查 LXD 环境"
-    echo "  2) 存储池管理"
+    
+    # 两列布局：左侧1-8，右侧9-15
+    printf "${COLOR_CYAN}%-40s %s${COLOR_NC}\n" "--- LXD 环境 ---" "--- 虚拟内存管理 ---"
+    printf "%-40s %s\n" "  1) 安装或检查 LXD 环境" "  9) 安装并配置 ZRAM"
+    printf "%-40s %s\n" "  2) 存储池管理" " 10) 移除 ZRAM"
+    printf "%-40s %s\n" "" " 11) 添加/修改 Swap 文件"
+    printf "${COLOR_CYAN}%-40s${COLOR_NC} %s\n" "--- 镜像管理 ---" " 12) 移除 Swap 文件"
+    printf "%-40s %s\n" "  3) 构建自定义镜像" ""
+    printf "%-40s %s\n" "  4) 备份所有本地 LXD 镜像" "${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
+    printf "%-40s %s\n" "  5) 列出本地 LXD 镜像" " 13) 部署 OpenGFW 防火墙"
+    printf "%-40s %s\n" "  6) 下载预构建镜像" " 14) 管理 OpenGFW"
     echo ""
-    echo -e "${COLOR_CYAN}--- 镜像管理 ---${COLOR_NC}"
-    echo "  3) 构建自定义镜像"
-    echo "  4) 备份所有本地 LXD 镜像"
-    echo "  5) 列出本地 LXD 镜像"
-    echo "  6) 下载预构建镜像"
+    printf "${COLOR_CYAN}%-40s %s${COLOR_NC}\n" "--- 服务器部署 ---" "--- 工具箱管理 ---"
+    printf "%-40s %s\n" "  7) 部署 LXD 服务器后端" " 15) 更新工具箱脚本"
+    printf "%-40s %s\n" "  8) 更新 LXD 服务器后端" ""
+    
     echo ""
-    echo -e "${COLOR_CYAN}--- 虚拟内存管理 ---${COLOR_NC}"
-    echo "  7) 安装并配置 ZRAM"
-    echo "  8) 移除 ZRAM"
-    echo "  9) 添加/修改 Swap 文件"
-    echo " 10) 移除 Swap 文件"
-    echo ""
-    echo -e "${COLOR_CYAN}--- 服务器部署 ---${COLOR_NC}"
-    echo " 11) 部署 LXD 服务器后端"
-    echo " 12) 更新 LXD 服务器后端"
-    echo ""
-    echo -e "${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
-    echo " 13) 部署 OpenGFW 防火墙"
-    echo " 14) 管理 OpenGFW"
-    echo ""
-    echo -e "${COLOR_CYAN}--- 工具箱管理 ---${COLOR_NC}"
-    echo " 15) 更新工具箱脚本"
-    echo ""
-    echo "  ---------------------------------------"
+    echo -e "${COLOR_GREEN}=========================================================================${COLOR_NC}"
     echo -e "  ${COLOR_RED}0) 退出脚本${COLOR_NC}"
-    echo -e "${COLOR_GREEN}=========================================${COLOR_NC}"
+    echo -e "${COLOR_GREEN}=========================================================================${COLOR_NC}"
     read -p "请输入您的选择: " choice
 }
 
@@ -2612,12 +2602,12 @@ main() {
                     download_prebuilt_images
                 fi
                 ;;
-            7) configure_zram ;;
-            8) remove_zram ;;
-            9) create_swap_file ;;
-            10) remove_swap_file ;;
-            11) deploy_lxd_server ;;
-            12) update_lxd_server ;;
+            7) deploy_lxd_server ;;
+            8) update_lxd_server ;;
+            9) configure_zram ;;
+            10) remove_zram ;;
+            11) create_swap_file ;;
+            12) remove_swap_file ;;
             13) deploy_opengfw ;;
             14) manage_opengfw ;;
             15) update_linuxtools ;;
