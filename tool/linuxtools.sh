@@ -1713,6 +1713,287 @@ deploy_lxd_server() {
     cd "$script_dir" || true
 }
 
+update_lxd_server() {
+    clear_screen
+    msg_info "--- LXD 服务器后端更新 ---"
+    echo ""
+    
+    # 检查后端是否已部署
+    if ! systemctl list-unit-files lxd-api.service &>/dev/null || \
+       ! [ -f /etc/systemd/system/lxd-api.service ]; then
+        msg_error "LXD 服务器后端未部署"
+        echo ""
+        msg_info "请先部署后端："
+        echo "  主菜单 -> 11) 部署 LXD 服务器后端"
+        echo ""
+        return 1
+    fi
+    
+    # 显示说明
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo -e "${COLOR_CYAN}  更新 LXD 服务器后端${COLOR_NC}"
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo ""
+    msg_info "此操作将："
+    echo "  ✓ 从 GitHub 下载最新代码"
+    echo "  ✓ 自动备份配置文件"
+    echo "  ✓ 更新所有 Python 代码和模板"
+    echo "  ✓ 保留现有配置和数据"
+    echo "  ✓ 重启后端服务"
+    echo ""
+    msg_warn "保留的内容："
+    echo "  • app.ini (配置文件)"
+    echo "  • network_config.env (网络配置)"
+    echo "  • *.db (数据库)"
+    echo "  • *.log (日志)"
+    echo ""
+    
+    # 询问确认
+    read -p "$(echo -e "${COLOR_YELLOW}是否开始更新? [y/N]: ${COLOR_NC}")" confirm
+    if [[ ! "${confirm}" =~ ^[yY]$ ]]; then
+        msg_info "操作已由用户取消。"
+        return
+    fi
+    
+    echo ""
+    msg_info "开始更新..."
+    echo ""
+    
+    # 检查当前部署目录
+    local deploy_dir="$HOME/lxd-toolkit/server"
+    if [[ ! -d "$deploy_dir" ]]; then
+        msg_error "未找到部署目录: $deploy_dir"
+        return 1
+    fi
+    
+    # 停止服务
+    msg_info "[1/8] 停止后端服务..."
+    systemctl stop lxd-api.service 2>/dev/null || true
+    systemctl stop lxd-flow-manager.service 2>/dev/null || true
+    msg_ok "✓ 服务已停止"
+    echo ""
+    
+    # 创建备份目录
+    local backup_dir="$HOME/lxd-toolkit/server_backup_$(date +%Y%m%d_%H%M%S)"
+    msg_info "[2/8] 备份配置和数据..."
+    mkdir -p "$backup_dir"
+    
+    # 备份配置文件
+    [[ -f "$deploy_dir/app.ini" ]] && cp "$deploy_dir/app.ini" "$backup_dir/"
+    [[ -f "$deploy_dir/network_config.env" ]] && cp "$deploy_dir/network_config.env" "$backup_dir/"
+    [[ -f "$deploy_dir/.env" ]] && cp "$deploy_dir/.env" "$backup_dir/"
+    
+    # 备份数据库
+    cp -f "$deploy_dir"/*.db "$backup_dir/" 2>/dev/null || true
+    
+    # 备份日志
+    cp -f "$deploy_dir"/*.log "$backup_dir/" 2>/dev/null || true
+    
+    msg_ok "✓ 配置和数据已备份到: $backup_dir"
+    echo ""
+    
+    # 下载最新代码
+    msg_info "[3/8] 从 GitHub 下载最新代码..."
+    local temp_dir="/tmp/lxd-server-update-$$"
+    mkdir -p "$temp_dir"
+    
+    if ! git clone --depth 1 https://github.com/jiayihello/xue.git "$temp_dir" 2>&1 | grep -v "warning:"; then
+        msg_error "下载失败，请检查网络连接"
+        rm -rf "$temp_dir"
+        systemctl start lxd-api.service
+        return 1
+    fi
+    msg_ok "✓ 最新代码下载完成"
+    echo ""
+    
+    # 检查下载的 server 目录
+    local new_server_dir="$temp_dir/server"
+    if [[ ! -d "$new_server_dir" ]]; then
+        msg_error "下载的代码中未找到 server 目录"
+        rm -rf "$temp_dir"
+        systemctl start lxd-api.service
+        return 1
+    fi
+    
+    # 更新 Python 代码
+    msg_info "[4/8] 更新 Python 代码..."
+    cp -f "$new_server_dir"/*.py "$deploy_dir/" 2>/dev/null || true
+    msg_ok "✓ Python 代码已更新"
+    echo ""
+    
+    # 更新模板文件
+    msg_info "[5/8] 更新模板和静态文件..."
+    if [[ -d "$new_server_dir/templates" ]]; then
+        rm -rf "$deploy_dir/templates"
+        cp -r "$new_server_dir/templates" "$deploy_dir/"
+        msg_ok "✓ 模板文件已更新"
+    fi
+    
+    if [[ -d "$new_server_dir/static" ]]; then
+        rm -rf "$deploy_dir/static"
+        cp -r "$new_server_dir/static" "$deploy_dir/"
+        msg_ok "✓ 静态文件已更新"
+    fi
+    echo ""
+    
+    # 更新脚本文件（除了部署脚本）
+    msg_info "[6/8] 更新脚本文件..."
+    for script in "$new_server_dir"/*.sh; do
+        local script_name=$(basename "$script")
+        # 跳过部署脚本，避免覆盖配置
+        if [[ "$script_name" != "deploy_all.sh" ]]; then
+            cp -f "$script" "$deploy_dir/"
+            chmod +x "$deploy_dir/$script_name"
+        fi
+    done
+    msg_ok "✓ 脚本文件已更新"
+    echo ""
+    
+    # 恢复配置文件
+    msg_info "[7/8] 恢复配置文件..."
+    [[ -f "$backup_dir/app.ini" ]] && cp "$backup_dir/app.ini" "$deploy_dir/"
+    [[ -f "$backup_dir/network_config.env" ]] && cp "$backup_dir/network_config.env" "$deploy_dir/"
+    [[ -f "$backup_dir/.env" ]] && cp "$backup_dir/.env" "$deploy_dir/"
+    msg_ok "✓ 配置文件已恢复"
+    echo ""
+    
+    # 清理临时文件
+    rm -rf "$temp_dir"
+    
+    # 重启服务
+    msg_info "[8/8] 重启后端服务..."
+    systemctl daemon-reload
+    systemctl start lxd-api.service
+    systemctl start lxd-flow-manager.service 2>/dev/null || true
+    sleep 2
+    
+    # 检查服务状态
+    if systemctl is-active --quiet lxd-api.service; then
+        msg_ok "✓ 服务已成功重启"
+        echo ""
+        msg_ok "==============================================="
+        msg_ok "✓ 后端更新完成！"
+        msg_ok "==============================================="
+        echo ""
+        msg_info "更新信息："
+        echo "  • 配置备份: $backup_dir"
+        echo "  • 服务状态: 运行中"
+        echo ""
+        msg_info "常用命令："
+        echo "  查看服务状态: systemctl status lxd-api.service"
+        echo "  查看服务日志: journalctl -u lxd-api.service -f"
+        echo "  恢复配置: cp $backup_dir/* $deploy_dir/"
+        echo ""
+    else
+        msg_error "服务启动失败"
+        echo ""
+        msg_info "故障排查："
+        echo "  1. 查看日志: journalctl -u lxd-api.service -n 50"
+        echo "  2. 检查配置: cat $deploy_dir/app.ini"
+        echo "  3. 恢复备份: cp $backup_dir/* $deploy_dir/"
+        echo "  4. 手动重启: systemctl restart lxd-api.service"
+        echo ""
+        return 1
+    fi
+}
+
+update_linuxtools() {
+    clear_screen
+    msg_info "--- 更新 LinuxTools 工具箱 ---"
+    echo ""
+    
+    # 显示说明
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo -e "${COLOR_CYAN}  更新 LinuxTools 工具箱${COLOR_NC}"
+    echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
+    echo ""
+    msg_info "此操作将："
+    echo "  ✓ 从 GitHub 下载最新版本"
+    echo "  ✓ 更新 ~/lxd-toolkit/tool/linuxtools.sh"
+    echo "  ✓ 不影响 ~/lxd-toolkit/server/ 目录"
+    echo ""
+    msg_warn "注意："
+    echo "  • 更新后需要重新运行脚本"
+    echo "  • 不会备份（脚本可随时从 GitHub 获取）"
+    echo ""
+    
+    # 询问确认
+    read -p "$(echo -e "${COLOR_YELLOW}是否开始更新? [y/N]: ${COLOR_NC}")" confirm
+    if [[ ! "${confirm}" =~ ^[yY]$ ]]; then
+        msg_info "操作已由用户取消。"
+        return
+    fi
+    
+    echo ""
+    msg_info "开始更新..."
+    echo ""
+    
+    # 获取当前工具箱目录
+    local current_dir="$HOME/lxd-toolkit"
+    
+    # 下载最新版本
+    msg_info "[1/3] 从 GitHub 下载最新版本..."
+    local temp_dir="/tmp/linuxtools-update-$$"
+    mkdir -p "$temp_dir"
+    
+    if ! git clone --depth 1 https://github.com/jiayihello/xue.git "$temp_dir" 2>&1 | grep -v "warning:"; then
+        msg_error "下载失败，请检查网络连接"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    msg_ok "✓ 最新版本下载完成"
+    echo ""
+    
+    # 检查下载的 tool 目录
+    local new_tools_dir="$temp_dir/tool"
+    if [[ ! -d "$new_tools_dir" ]]; then
+        msg_error "下载的代码中未找到 tool 目录"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # 更新工具箱文件
+    msg_info "[2/3] 更新工具箱脚本..."
+    
+    # 确保目标目录存在
+    mkdir -p "$current_dir/tool"
+    
+    # 只复制 tool 目录，不会影响 server 目录
+    cp -f "$new_tools_dir"/* "$current_dir/tool/" 2>/dev/null || true
+    chmod +x "$current_dir/tool/linuxtools.sh"
+    
+    msg_ok "✓ 工具箱脚本已更新"
+    echo ""
+    
+    # 清理临时文件
+    msg_info "[3/3] 清理临时文件..."
+    rm -rf "$temp_dir"
+    msg_ok "✓ 清理完成"
+    echo ""
+    
+    # 显示完成信息
+    msg_ok "==============================================="
+    msg_ok "✓ 工具箱脚本更新完成！"
+    msg_ok "==============================================="
+    echo ""
+    msg_info "更新内容："
+    echo "  • 已更新: $current_dir/tool/linuxtools.sh"
+    echo "  • 未改动: $current_dir/server/ 目录"
+    echo ""
+    msg_warn "重要提示："
+    echo "  1. 请退出当前脚本（选择 0）"
+    echo "  2. 重新运行以使用新版本："
+    echo "     cd $current_dir/tool"
+    echo "     bash linuxtools.sh"
+    echo ""
+    msg_info "提示："
+    echo "  • 如需更新后端服务，请使用选项 12"
+    echo "  • 出问题可重新执行初始下载命令"
+    echo ""
+    
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+}
+
 deploy_opengfw() {
     clear_screen
     msg_info "--- OpenGFW 深度包检测防火墙部署 ---"
@@ -2265,10 +2546,14 @@ show_main_menu() {
     echo ""
     echo -e "${COLOR_CYAN}--- 服务器部署 ---${COLOR_NC}"
     echo " 11) 部署 LXD 服务器后端"
+    echo " 12) 更新 LXD 服务器后端"
     echo ""
     echo -e "${COLOR_CYAN}--- OpenGFW 防火墙 ---${COLOR_NC}"
-    echo " 12) 部署 OpenGFW 防火墙"
-    echo " 13) 管理 OpenGFW"
+    echo " 13) 部署 OpenGFW 防火墙"
+    echo " 14) 管理 OpenGFW"
+    echo ""
+    echo -e "${COLOR_CYAN}--- 工具箱管理 ---${COLOR_NC}"
+    echo " 15) 更新工具箱脚本"
     echo ""
     echo "  ---------------------------------------"
     echo -e "  ${COLOR_RED}0) 退出脚本${COLOR_NC}"
@@ -2332,8 +2617,10 @@ main() {
             9) create_swap_file ;;
             10) remove_swap_file ;;
             11) deploy_lxd_server ;;
-            12) deploy_opengfw ;;
-            13) manage_opengfw ;;
+            12) update_lxd_server ;;
+            13) deploy_opengfw ;;
+            14) manage_opengfw ;;
+            15) update_linuxtools ;;
             0) 
             msg_info "感谢使用，再见！"
             exit 0
