@@ -199,13 +199,14 @@ while true; do
         2)
             IPV6_MODE="NAT66"
             echo ""
-            read -p "$(echo -e "${COLOR_YELLOW}请输入 NAT66 配置 (例如 fd00::/64):${COLOR_NC} ")" IPV6_PREFIX
-            log_ok "IPv6 模式: $IPV6_MODE, 配置: $IPV6_PREFIX"
+            read -p "$(echo -e "${COLOR_YELLOW}请输入 NAT66 监听地址 (例如 fd00::1/128):${COLOR_NC} ")" NAT_LISTEN_IPV6
+            log_ok "IPv6 模式: $IPV6_MODE, 监听地址: $NAT_LISTEN_IPV6"
             break
             ;;
         3)
             IPV6_MODE="off"
             IPV6_PREFIX=""
+            NAT_LISTEN_IPV6=""
             log_ok "IPv6 模式: 禁用"
             break
             ;;
@@ -223,6 +224,7 @@ MAIN_INTERFACE=$MAIN_INTERFACE
 IPV4_ADDRESS=$IPV4_ADDRESS
 IPV6_MODE=$IPV6_MODE
 IPV6_PREFIX=$IPV6_PREFIX
+NAT_LISTEN_IPV6=$NAT_LISTEN_IPV6
 EOF
 
 # 执行网络配置
@@ -230,7 +232,7 @@ echo ""
 log_info "执行网络配置脚本..."
 if [ -f "network_setup.py" ]; then
     # 设置环境变量供 Python 脚本使用
-    export MAIN_INTERFACE IPV4_ADDRESS IPV6_MODE IPV6_PREFIX
+    export MAIN_INTERFACE IPV4_ADDRESS IPV6_MODE IPV6_PREFIX NAT_LISTEN_IPV6
     
     if python3 network_setup.py; then
         log_ok "网络配置完成"
@@ -453,12 +455,21 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
         fi
     fi
     
-    # 更新 IPV6_PREFIX
+    # 更新 IPV6_PREFIX（仅 ROUTED 模式）
     if [ -n "$IPV6_PREFIX" ]; then
         if grep -q "^IPV6_PREFIX\s*=" app.ini; then
             sed -i "s|^IPV6_PREFIX\s*=.*|IPV6_PREFIX = $IPV6_PREFIX|g" app.ini
         else
             echo "IPV6_PREFIX = $IPV6_PREFIX" >> app.ini
+        fi
+    fi
+    
+    # 更新 NAT_LISTEN_IPV6（仅 NAT66 模式）
+    if [ -n "$NAT_LISTEN_IPV6" ]; then
+        if grep -q "^NAT_LISTEN_IPV6\s*=" app.ini; then
+            sed -i "s|^NAT_LISTEN_IPV6\s*=.*|NAT_LISTEN_IPV6 = $NAT_LISTEN_IPV6|g" app.ini
+        else
+            echo "NAT_LISTEN_IPV6 = $NAT_LISTEN_IPV6" >> app.ini
         fi
     fi
     
@@ -469,6 +480,9 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
         log_info "  IPV6_MODE = $IPV6_MODE"
         if [ -n "$IPV6_PREFIX" ]; then
             log_info "  IPV6_PREFIX = $IPV6_PREFIX"
+        fi
+        if [ -n "$NAT_LISTEN_IPV6" ]; then
+            log_info "  NAT_LISTEN_IPV6 = $NAT_LISTEN_IPV6"
         fi
     fi
     
