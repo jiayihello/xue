@@ -1908,6 +1908,133 @@ update_lxd_server() {
     fi
 }
 
+cleanup_old_backend() {
+    clear_screen
+    msg_info "--- 清理旧版本 LXD 后端服务 ---"
+    echo ""
+    
+    echo -e "${COLOR_YELLOW}========================================${COLOR_NC}"
+    echo -e "${COLOR_YELLOW}  清理旧版本 LXD 后端服务${COLOR_NC}"
+    echo -e "${COLOR_YELLOW}========================================${COLOR_NC}"
+    echo ""
+    
+    msg_info "此工具将执行以下操作："
+    echo "  1. 停止所有旧版本后端服务"
+    echo "  2. 禁用服务自启动"
+    echo "  3. 删除旧的 systemd 服务文件"
+    echo "  4. 重新加载 systemd 配置"
+    echo ""
+    msg_warn "⚠️  注意：此操作不会影响容器本身和数据"
+    echo ""
+    
+    read -p "确认执行清理操作？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        msg_info "操作已取消"
+        return 0
+    fi
+    
+    echo ""
+    msg_info "开始清理旧服务..."
+    echo ""
+    
+    # 定义旧服务列表
+    local old_services=(
+        "lxd-api.service"
+        "lxd-flow-continuity.service"
+        "lxd-flow-collector.service"
+        "lxd-event-listener.service"
+        "flow-limit-enforcer.service"
+        "flow-reset-scheduler.service"
+        "periodic-sync.service"
+    )
+    
+    # 步骤 1: 停止所有旧服务
+    msg_info "步骤 1/4: 停止旧服务..."
+    for service in "${old_services[@]}"; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            echo "  停止: $service"
+            systemctl stop "$service" 2>/dev/null || true
+            msg_ok "  ✓ 已停止: $service"
+        else
+            echo "  跳过: $service (未运行)"
+        fi
+    done
+    echo ""
+    
+    # 步骤 2: 禁用自启动
+    msg_info "步骤 2/4: 禁用服务自启动..."
+    for service in "${old_services[@]}"; do
+        if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+            echo "  禁用: $service"
+            systemctl disable "$service" 2>/dev/null || true
+            msg_ok "  ✓ 已禁用: $service"
+        else
+            echo "  跳过: $service (未启用)"
+        fi
+    done
+    echo ""
+    
+    # 步骤 3: 删除旧的 service 文件
+    msg_info "步骤 3/4: 删除旧的 systemd 服务文件..."
+    local service_files=(
+        "/etc/systemd/system/lxd-api.service"
+        "/etc/systemd/system/lxd-flow-continuity.service"
+        "/etc/systemd/system/lxd-flow-collector.service"
+        "/etc/systemd/system/lxd-event-listener.service"
+        "/etc/systemd/system/flow-limit-enforcer.service"
+        "/etc/systemd/system/flow-reset-scheduler.service"
+        "/etc/systemd/system/periodic-sync.service"
+    )
+    
+    for file in "${service_files[@]}"; do
+        if [[ -f "$file" ]]; then
+            echo "  删除: $file"
+            rm -f "$file"
+            msg_ok "  ✓ 已删除: $(basename $file)"
+        else
+            echo "  跳过: $(basename $file) (不存在)"
+        fi
+    done
+    echo ""
+    
+    # 步骤 4: 重新加载 systemd
+    msg_info "步骤 4/4: 重新加载 systemd 配置..."
+    systemctl daemon-reload
+    msg_ok "  ✓ systemd 配置已重新加载"
+    echo ""
+    
+    # 验证清理结果
+    echo -e "${COLOR_GREEN}========================================${COLOR_NC}"
+    echo -e "${COLOR_GREEN}  清理完成！${COLOR_NC}"
+    echo -e "${COLOR_GREEN}========================================${COLOR_NC}"
+    echo ""
+    
+    msg_info "验证结果："
+    echo ""
+    
+    # 检查是否还有残留服务
+    local remaining=0
+    for service in "${old_services[@]}"; do
+        if systemctl list-units --all | grep -q "$service"; then
+            echo "  ⚠  $service 仍然存在"
+            remaining=$((remaining + 1))
+        fi
+    done
+    
+    if [[ $remaining -eq 0 ]]; then
+        msg_ok "  ✓ 所有旧服务已清理干净"
+    else
+        msg_warn "  ⚠  发现 $remaining 个残留服务（可能需要重启系统）"
+    fi
+    echo ""
+    
+    msg_info "后续步骤："
+    echo "  1. 现在可以部署新版本后端（选项 7）"
+    echo "  2. 或者更新现有后端（选项 8）"
+    echo "  3. 旧容器不受影响，数据完全安全"
+    echo ""
+}
+
 update_linuxtools() {
     clear_screen
     msg_info "--- 更新 LinuxTools 工具箱 ---"
@@ -2553,7 +2680,7 @@ show_main_menu() {
     echo ""
     echo -e "${COLOR_CYAN}--- 服务器部署 ---${COLOR_NC}                      ${COLOR_CYAN}--- 工具箱管理 ---${COLOR_NC}"
     echo "  7) 部署 LXD 服务器后端                15) 更新工具箱脚本"
-    echo "  8) 更新 LXD 服务器后端"
+    echo "  8) 更新 LXD 服务器后端                16) 清理旧版本后端服务"
     
     echo ""
     echo -e "${COLOR_GREEN}=========================================================================${COLOR_NC}"
@@ -2622,6 +2749,7 @@ main() {
             13) deploy_opengfw ;;
             14) manage_opengfw ;;
             15) update_linuxtools ;;
+            16) cleanup_old_backend ;;
             0) 
             msg_info "感谢使用，再见！"
             exit 0
