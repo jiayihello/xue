@@ -1672,8 +1672,19 @@ deploy_lxd_server() {
         msg_info "开始自动检查部署状态..."
         sleep 2
         
-        local check_script="$server_dir/post_deployment_check.sh"
-        if [[ -f "$check_script" ]]; then
+        # 查找检查脚本（支持多个可能的位置）
+        local check_script=""
+        if [[ -f "$server_dir/tools/diagnostic/check_deployment.sh" ]]; then
+            check_script="$server_dir/tools/diagnostic/check_deployment.sh"
+        elif [[ -f "$server_dir/tools/diagnostic/post_deployment_check.sh" ]]; then
+            check_script="$server_dir/tools/diagnostic/post_deployment_check.sh"
+        elif [[ -f "$server_dir/tools/post_deployment_check.sh" ]]; then
+            check_script="$server_dir/tools/post_deployment_check.sh"
+        elif [[ -f "$server_dir/post_deployment_check.sh" ]]; then
+            check_script="$server_dir/post_deployment_check.sh"
+        fi
+        
+        if [[ -n "$check_script" && -f "$check_script" ]]; then
             chmod +x "$check_script"
             if bash "$check_script"; then
                 echo ""

@@ -1,227 +1,315 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+流量重置调度器
+定期检查并重置到期容器的流量
+建议每天凌晨运行一次
+"""
 
-import sys
-import os
 import logging
-import sqlite3
-from datetime import datetime
+import sys
+from datetime import date
+from logging.handlers import RotatingFileHandler
+from flow_manager_v2 import FlowManagerV2
+from iptables_manager import IptablesManager
 
-# 添加当前目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from flow_manager import FlowManager
-from lxc_manager import LXCManager
-from config_handler import app_config
-
-# 配置日志
-logging.basicConfig(
-    level=getattr(logging, app_config.log_level.upper(), logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('flow_reset.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-def auto_reset_flows():
-    """自动重置到期的容器流量"""
-    logger.info("开始执行自动流量重置任务")
+# 配置日志（添加日志轮转）
+def setup_logging():
+    """设置日志配置（支持日志轮转）"""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
     
-    try:
-        flow_manager = FlowManager()
-        lxc_manager = LXCManager()
-        
-        # 获取需要重置流量的容器
-        containers_to_reset = flow_manager.get_containers_need_reset()
-        
-        if not containers_to_reset:
-            logger.info("没有需要重置流量的容器")
-            return
-        
-        logger.info(f"发现 {len(containers_to_reset)} 个容器需要重置流量: {containers_to_reset}")
-        
-        success_count = 0
-        failed_count = 0
-        
-        for hostname in containers_to_reset:
-            try:
-                logger.info(f"正在重置容器 {hostname} 的流量...")
-                
-                # 获取容器当前流量统计
-                container_info = lxc_manager.get_container_info(hostname)
-                if container_info['code'] != 200:
-                    logger.warning(f"无法获取容器 {hostname} 信息: {container_info['msg']}")
-                    failed_count += 1
-                    continue
-                
-                # 获取LXD容器对象以读取网络统计
-                container = lxc_manager._get_container_or_error(hostname)
-                if not container:
-                    logger.warning(f"容器 {hostname} 不存在，从流量管理系统中清理")
-                    # 自动清理已删除的容器记录
-                    if flow_manager.unregister_container(hostname):
-                        logger.info(f"已清理删除容器 {hostname} 的流量管理记录")
-                    failed_count += 1
-                    continue
-                
-                # 获取当前网络统计
-                state = container.state()
-                current_bytes_received = 0
-                current_bytes_sent = 0
-                
-                if state.network:
-                    for nic_name, nic_data in state.network.items():
-                        if 'counters' in nic_data:
-                            current_bytes_received += nic_data['counters'].get('bytes_received', 0)
-                            current_bytes_sent += nic_data['counters'].get('bytes_sent', 0)
-                
-                # 执行流量重置
-                if flow_manager.reset_container_flow(
-                    hostname, 
-                    current_bytes_received, 
-                    current_bytes_sent, 
-                    reset_type='auto'
-                ):
-                    logger.info(f"✅ 容器 {hostname} 流量重置成功")
-                    success_count += 1
-                else:
-                    logger.error(f"❌ 容器 {hostname} 流量重置失败")
-                    failed_count += 1
-                    
-            except Exception as e:
-                logger.error(f"重置容器 {hostname} 流量时发生异常: {e}", exc_info=True)
-                failed_count += 1
-        
-        logger.info(f"自动流量重置任务完成: 成功 {success_count}, 失败 {failed_count}")
-        
-    except Exception as e:
-        logger.error(f"执行自动流量重置任务时发生异常: {e}", exc_info=True)
-
-def register_existing_containers():
-    """将现有容器注册到流量管理系统"""
-    logger.info("开始注册现有容器到流量管理系统")
+    # 文件处理器（10MB 轮转，保留 5 个备份）
+    file_handler = RotatingFileHandler(
+        'flow_reset.log',
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    )
     
-    try:
-        flow_manager = FlowManager()
-        lxc_manager = LXCManager()
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    )
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logging()
+
+
+class FlowResetScheduler:
+    """流量重置调度器"""
+    
+    def __init__(self):
+        """初始化调度器"""
+        self.flow_mgr = FlowManagerV2()
+        self.iptables_mgr = IptablesManager()
+    
+    def reset_due_containers(self) -> dict:
+        """
+        重置所有到期的容器
         
-        # 获取所有容器
-        all_containers = lxc_manager.client.containers.all()
+        Returns:
+            重置统计信息
+        """
+        logger.info("开始检查需要重置的容器...")
         
-        registered_count = 0
-        skipped_count = 0
+        stats = {
+            'total_checked': 0,
+            'due': 0,
+            'reset': 0,
+            'failed': 0,
+            'errors': []
+        }
         
-        for container in all_containers:
-            hostname = container.name
-            
-            # 检查是否已经注册
-            if flow_manager.get_container_flow_info(hostname):
-                logger.debug(f"容器 {hostname} 已在流量管理系统中注册，跳过")
-                skipped_count += 1
-                continue
-            
+        # 获取所有到期的容器
+        overdue_containers = self.flow_mgr.check_and_get_overdue_containers()
+        stats['due'] = len(overdue_containers)
+        
+        if stats['due'] == 0:
+            logger.info("没有需要重置的容器")
+            return stats
+        
+        logger.info(f"找到 {stats['due']} 个需要重置的容器")
+        
+        # 逐个重置
+        for hostname in overdue_containers:
             try:
                 # 获取容器信息
-                container_info = lxc_manager.get_container_info(hostname)
-                if container_info['code'] != 200:
-                    logger.warning(f"无法获取容器 {hostname} 信息，跳过注册")
+                info = self.flow_mgr.get_container_usage(hostname)
+                if not info:
+                    logger.warning(f"容器 {hostname} 信息获取失败，跳过")
+                    stats['failed'] += 1
                     continue
                 
-                # 获取流量限制
-                flow_limit_gb = int(lxc_manager._get_user_metadata(container, 'flow_limit_gb', 0))
+                used_gb = info['used_gb']
+                logger.info(f"重置容器 {hostname}: 已用 {used_gb:.2f}GB")
                 
-                # 使用容器创建时间作为开通日期
-                try:
-                    if container.created_at:
-                        if isinstance(container.created_at, str):
-                            # 解析ISO格式的时间字符串
-                            created_datetime = datetime.fromisoformat(container.created_at.replace('Z', '+00:00'))
-                            created_date = created_datetime.date()
+                # 重置流量
+                success = self.flow_mgr.reset_container_flow(hostname, 'scheduled')
+                
+                if success:
+                    # 如果容器被封禁，解除封禁
+                    if info['is_blocked']:
+                        logger.info(f"容器 {hostname} 被封禁，正在解封...")
+                        unblock_success = self.iptables_mgr.unblock_container(hostname)
+                        if unblock_success:
+                            self.flow_mgr.set_container_blocked(hostname, False)
+                            logger.info(f"✓ 容器 {hostname} 已解封")
                         else:
-                            created_date = container.created_at.date()
-                    else:
-                        created_date = datetime.now().date()
-                except Exception as e:
-                    logger.warning(f"解析容器 {hostname} 创建时间失败: {e}，使用当前日期")
-                    created_date = datetime.now().date()
-                
-                # 注册到流量管理系统
-                if flow_manager.register_container(hostname, flow_limit_gb, created_date):
-                    logger.info(f"✅ 容器 {hostname} 已注册到流量管理系统")
-                    registered_count += 1
+                            logger.warning(f"⚠ 容器 {hostname} 解封失败")
+                    
+                    stats['reset'] += 1
+                    logger.info(f"✓ 容器 {hostname} 流量已重置")
                 else:
-                    logger.error(f"❌ 容器 {hostname} 注册失败")
+                    stats['failed'] += 1
+                    stats['errors'].append(f"{hostname}: 重置失败")
+                    logger.error(f"✗ 容器 {hostname} 流量重置失败")
                     
             except Exception as e:
-                logger.error(f"注册容器 {hostname} 时发生异常: {e}")
+                stats['failed'] += 1
+                error_msg = f"{hostname}: {str(e)}"
+                stats['errors'].append(error_msg)
+                logger.error(f"重置容器 {hostname} 失败: {e}")
         
-        logger.info(f"容器注册完成: 新注册 {registered_count}, 已存在 {skipped_count}")
+        # 输出统计
+        logger.info(f"重置完成: 到期={stats['due']}, 成功={stats['reset']}, "
+                   f"失败={stats['failed']}")
         
-    except Exception as e:
-        logger.error(f"注册现有容器时发生异常: {e}", exc_info=True)
-
-def cleanup_deleted_containers():
-    """清理已删除容器的流量管理记录"""
-    logger.info("开始清理已删除容器的流量管理记录")
-
-    try:
-        flow_manager = FlowManager()
-        lxc_manager = LXCManager()
-
-        # 获取所有在流量管理系统中的容器
-        with sqlite3.connect(flow_manager.db_path) as conn:
-            cursor = conn.execute("SELECT hostname FROM container_flow_management")
-            managed_containers = [row[0] for row in cursor.fetchall()]
-
-        if not managed_containers:
-            logger.info("流量管理系统中没有容器记录")
-            return
-
-        # 获取所有实际存在的容器
-        existing_containers = [c.name for c in lxc_manager.client.containers.all()]
-
-        # 找出已删除的容器
-        deleted_containers = set(managed_containers) - set(existing_containers)
-
-        if not deleted_containers:
-            logger.info("没有发现已删除的容器记录")
-            return
-
-        logger.info(f"发现 {len(deleted_containers)} 个已删除的容器记录: {list(deleted_containers)}")
-
-        cleaned_count = 0
-        for hostname in deleted_containers:
-            if flow_manager.unregister_container(hostname):
-                logger.info(f"✅ 已清理容器 {hostname} 的流量管理记录")
-                cleaned_count += 1
+        if stats['errors']:
+            logger.warning(f"遇到 {len(stats['errors'])} 个错误:")
+            for error in stats['errors'][:10]:
+                logger.warning(f"  - {error}")
+        
+        return stats
+    
+    def reset_one(self, hostname: str, reset_type: str = 'manual') -> bool:
+        """
+        重置单个容器的流量
+        
+        Args:
+            hostname: 容器主机名
+            reset_type: 重置类型（'manual' 或 'scheduled'）
+            
+        Returns:
+            是否成功
+        """
+        logger.info(f"重置容器 {hostname} 的流量...")
+        
+        try:
+            # 获取容器信息
+            info = self.flow_mgr.get_container_usage(hostname)
+            if not info:
+                logger.error(f"容器 {hostname} 未注册")
+                return False
+            
+            used_gb = info['used_gb']
+            logger.info(f"当前已用流量: {used_gb:.2f}GB")
+            
+            # 重置流量
+            success = self.flow_mgr.reset_container_flow(hostname, reset_type)
+            
+            if success:
+                # 如果容器被封禁，解除封禁
+                if info['is_blocked']:
+                    logger.info(f"容器 {hostname} 被封禁，正在解封...")
+                    unblock_success = self.iptables_mgr.unblock_container(hostname)
+                    if unblock_success:
+                        self.flow_mgr.set_container_blocked(hostname, False)
+                        logger.info(f"✓ 容器 {hostname} 已解封")
+                    else:
+                        logger.warning(f"⚠ 容器 {hostname} 解封失败")
+                
+                logger.info(f"✓ 容器 {hostname} 流量已重置: {used_gb:.2f}GB → 0GB")
+                return True
             else:
-                logger.error(f"❌ 清理容器 {hostname} 记录失败")
+                logger.error(f"✗ 容器 {hostname} 流量重置失败")
+                return False
+                
+        except Exception as e:
+            logger.error(f"重置容器 {hostname} 失败: {e}")
+            return False
+    
+    def show_status(self):
+        """显示重置状态"""
+        logger.info("=" * 70)
+        logger.info("流量重置调度器状态")
+        logger.info("=" * 70)
+        
+        today = date.today()
+        
+        # 获取所有到期的容器
+        overdue = self.flow_mgr.check_and_get_overdue_containers()
+        
+        logger.info(f"当前日期: {today}")
+        logger.info(f"到期容器数: {len(overdue)}")
+        
+        if overdue:
+            logger.warning(f"\n需要重置的容器 ({len(overdue)}个):")
+            for hostname in overdue[:20]:  # 最多显示20个
+                info = self.flow_mgr.get_container_usage(hostname)
+                if info:
+                    logger.warning(f"  - {hostname}: {info['used_gb']:.2f}GB, "
+                                 f"应于 {info['next_reset_date']} 重置")
+        
+        # 显示最近的重置日期
+        containers = self.flow_mgr.list_all_containers()
+        if containers:
+            logger.info(f"\n最近的重置日期:")
+            # 按重置日期排序
+            sorted_containers = sorted(containers, 
+                                      key=lambda x: x['next_reset_date'])
+            for c in sorted_containers[:10]:
+                logger.info(f"  - {c['hostname']}: {c['next_reset_date']}")
+        
+        logger.info("=" * 70)
+    
+    def reset_all(self, force: bool = False) -> dict:
+        """
+        重置所有容器（仅用于测试或特殊情况）
+        
+        Args:
+            force: 是否强制重置（忽略日期）
+            
+        Returns:
+            重置统计信息
+        """
+        if not force:
+            logger.error("reset_all 需要 --force 参数，防止误操作")
+            return {'error': 'force required'}
+        
+        logger.warning("⚠️ 强制重置所有容器的流量...")
+        
+        containers = self.flow_mgr.list_all_containers()
+        stats = {
+            'total': len(containers),
+            'success': 0,
+            'failed': 0
+        }
+        
+        for c in containers:
+            hostname = c['hostname']
+            success = self.reset_one(hostname, 'manual')
+            if success:
+                stats['success'] += 1
+            else:
+                stats['failed'] += 1
+        
+        logger.info(f"批量重置完成: 总数={stats['total']}, "
+                   f"成功={stats['success']}, 失败={stats['failed']}")
+        
+        return stats
 
-        logger.info(f"清理完成: 成功清理 {cleaned_count} 个记录")
-
-    except Exception as e:
-        logger.error(f"清理已删除容器记录时发生异常: {e}", exc_info=True)
 
 def main():
     """主函数"""
-    if len(sys.argv) > 1:
-        command = sys.argv[1]
-        if command == 'register':
-            register_existing_containers()
-        elif command == 'reset':
-            auto_reset_flows()
-        elif command == 'cleanup':
-            cleanup_deleted_containers()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='流量重置调度器')
+    parser.add_argument('action', nargs='?', default='reset_due',
+                       choices=['reset_due', 'reset', 'status', 'reset_all'],
+                       help='操作类型')
+    parser.add_argument('--hostname', help='容器主机名（用于 reset）')
+    parser.add_argument('--force', action='store_true',
+                       help='强制执行（用于 reset_all）')
+    parser.add_argument('--verbose', '-v', action='store_true', help='详细输出')
+    
+    args = parser.parse_args()
+    
+    # 设置日志级别
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    scheduler = FlowResetScheduler()
+    
+    if args.action == 'status':
+        # 显示状态
+        scheduler.show_status()
+        sys.exit(0)
+    
+    elif args.action == 'reset':
+        # 重置单个容器
+        if not args.hostname:
+            logger.error("需要指定 --hostname")
+            sys.exit(1)
+        success = scheduler.reset_one(args.hostname, 'manual')
+        sys.exit(0 if success else 1)
+    
+    elif args.action == 'reset_all':
+        # 重置所有容器
+        stats = scheduler.reset_all(force=args.force)
+        if 'error' in stats:
+            sys.exit(1)
+        elif stats['failed'] > 0:
+            sys.exit(1)
         else:
-            print("用法:")
-            print("  python3 flow_reset_scheduler.py register  # 注册现有容器")
-            print("  python3 flow_reset_scheduler.py reset     # 执行流量重置")
-            print("  python3 flow_reset_scheduler.py cleanup   # 清理已删除容器记录")
-    else:
-        # 默认执行流量重置
-        auto_reset_flows()
+            sys.exit(0)
+    
+    elif args.action == 'reset_due':
+        # 重置到期容器（默认）
+        stats = scheduler.reset_due_containers()
+        if stats['failed'] > 0:
+            sys.exit(1)
+        else:
+            sys.exit(0)
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.info("调度器被用户中断")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"调度器异常: {e}", exc_info=True)
+        sys.exit(1)
+

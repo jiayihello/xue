@@ -1,18 +1,14 @@
 import os
-from flask import Flask, render_template, jsonify, request, session, redirect, url_for
+from flask import Flask, jsonify, request
 from functools import wraps
 import logging
-import datetime
-from math import ceil
 
 from config_handler import app_config
-from lxc_manager import LXCManager, _load_iptables_rules_metadata
-from flow_manager import FlowManager
+from lxc_manager import LXCManager
 # 导入网络配置模块
 import network_setup
 
-app = Flask(__name__, template_folder='templates', static_folder='static')
-app.secret_key = os.urandom(24)
+app = Flask(__name__)
 
 logging.basicConfig(level=getattr(logging, app_config.log_level, logging.INFO),
                     format='%(asctime)s %(levelname)s: %(message)s [%(filename)s:%(lineno)d]',
@@ -50,23 +46,14 @@ def get_flow_manager():
     global flow_manager
     if flow_manager is None:
         try:
-            from flow_manager import FlowManager
-            flow_manager = FlowManager()
+            from flow_manager_v2 import FlowManagerV2
+            flow_manager = FlowManagerV2()
         except Exception as e:
             logger.warning(f"无法初始化流量管理器: {e}")
             return None
     return flow_manager
 
-# === Authentication for Web UI ===
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'logged_in' not in session:
-            return redirect(url_for('login', next=request.url))
-        return f(*args, **kwargs)
-    return decorated_function
-
-# === Authentication for external API (lxdserver.php) ===
+# === Authentication for API ===
 def api_key_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -78,253 +65,7 @@ def api_key_required(f):
             return jsonify({'code': 401, 'msg': '认证失败或API密钥无效'}), 401
     return decorated_function
 
-def adapt_response(lxd_response, success_status='success', error_status='error'):
-    if lxd_response.get('code') == 200:
-        return {'status': success_status, 'message': lxd_response.get('msg', '操作成功')}
-    else:
-        return {'status': error_status, 'message': lxd_response.get('msg', '操作失败')}
-
-# === Routes for Web UI ===
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    template_context = {
-        'session': session,
-        'incus_error': (False, None),
-        'image_error': (False, None),
-        'storage_error': (False, None),
-        'containers': [],
-        'images': [],
-        'available_pools': [],
-        'login_error': None,
-        'pagination': {}
-    }
-
-    if request.method == 'POST':
-        if request.form.get('password') == app_config.token:
-            session['logged_in'] = True
-            next_url = request.args.get('next')
-            return redirect(next_url or url_for('index'))
-        else:
-            template_context['login_error'] = "密码错误"
-            return render_template('index.html', **template_context)
-            
-    return render_template('index.html', **template_context)
-
-@app.route('/logout')
-def logout():
-    session.pop('logged_in', None)
-    return redirect(url_for('login'))
-
-@app.route('/')
-@login_required
-def index():
-    incus_error = (False, None)
-    containers_list = []
-    try:
-        fingerprint_to_alias_map = {}
-        all_images_for_map = lxc.client.images.all()
-        for img in all_images_for_map:
-            if img.aliases:
-                fingerprint_to_alias_map[img.fingerprint] = img.aliases[0]['name']
-
-        all_containers = lxc.client.containers.all()
-        for c in all_containers:
-            info_res = lxc.get_container_info(c.name)
-            data = info_res.get('data', {})
-
-            container_fingerprint = c.config.get('volatile.base_image')
-            image_source = "N/A"
-            if container_fingerprint:
-                image_source = fingerprint_to_alias_map.get(
-                    container_fingerprint,
-                    c.config.get('image.description', container_fingerprint)
-                )
-            else:
-                image_source = c.config.get('image.description', 'N/A')
-            
-            created_at_val = c.created_at
-            if isinstance(created_at_val, datetime.datetime):
-                created_at_str = created_at_val.isoformat()
-            else:
-                created_at_str = str(created_at_val) if created_at_val else 'N/A'
-
-            containers_list.append({
-                'name': c.name,
-                'status': c.status,
-                'ip': data.get('PublicIPv4', data.get('IP', 'N/A')),
-                'ipv6_list': data.get('IPv6List', []),
-                'public_ipv4': data.get('PublicIPv4', None),
-                'public_ssh_port': data.get('PublicSSHPort', None),
-                'image_source': image_source,
-                'created_at': created_at_str,
-                'cpu_usage': data.get('UsedCPU', '-'),
-                'mem_usage': data.get('UsedRam', '-'),
-                'disk_usage': data.get('UsedDisk', '-'),
-                'total_flow': data.get('UseBandwidth_GB', '-'),
-                'mem_total': data.get('TotalRam', 0),
-                'disk_total': data.get('TotalDisk', 0),
-                'flow_limit': data.get('Bandwidth', 0)
-            })
-    except Exception as e:
-        logger.error(f"获取容器列表失败: {e}", exc_info=True)
-        incus_error = (True, str(e))
-
-    page = request.args.get('page', 1, type=int)
-    allowed_per_page = [20, 50, 100]
-    per_page = request.args.get('per_page', 20, type=int)
-    if per_page not in allowed_per_page:
-        per_page = 20
-
-    total_items = len(containers_list)
-    total_pages = ceil(total_items / per_page)
-    start = (page - 1) * per_page
-    end = start + per_page
-    paginated_containers = sorted(containers_list, key=lambda x: x['name'])[start:end]
-
-
-    image_error = (False, None)
-    available_images = []
-    try:
-        all_images = lxc.client.images.all()
-        for img in all_images:
-            if not img.aliases: continue
-            alias_name = img.aliases[0]['name']
-            desc = img.properties.get('description', '无描述')
-            available_images.append({'name': alias_name, 'description': f"{alias_name} ({desc})"})
-    except Exception as e:
-        logger.error(f"获取镜像列表失败: {e}")
-        image_error = (True, str(e))
-
-    storage_error = (False, None)
-    available_pools = []
-    try:
-        all_pools = lxc.client.storage_pools.all()
-        available_pools = [p.name for p in all_pools]
-    except Exception as e:
-        logger.error(f"获取存储池列表失败: {e}")
-        storage_error = (True, str(e))
-
-    pagination_details = {
-        'page': page,
-        'per_page': per_page,
-        'total_pages': total_pages,
-        'total_items': total_items,
-        'allowed_per_page': allowed_per_page
-    }
-
-    return render_template('index.html',
-                           containers=paginated_containers,
-                           images=available_images,
-                           available_pools=available_pools,
-                           incus_error=incus_error,
-                           image_error=image_error,
-                           storage_error=storage_error,
-                           pagination=pagination_details,
-                           session=session)
-
-@app.route('/container/<name>/action', methods=['POST'])
-@login_required
-def container_action(name):
-    action = request.form.get('action')
-    logger.info(f"WebUI请求对 {name} 执行操作: {action}")
-    if action == 'start':
-        result = lxc.start_container(name)
-    elif action == 'stop':
-        result = lxc.stop_container(name)
-    elif action == 'restart':
-        result = lxc.restart_container(name)
-    elif action == 'delete':
-        result = lxc.delete_container(name)
-    else:
-        result = {'code': 400, 'msg': '无效操作'}
-    return jsonify(adapt_response(result))
-
-@app.route('/container/<name>/info')
-@login_required
-def container_info(name):
-    logger.info(f"WebUI请求获取 {name} 的信息")
-    res = lxc.get_container_info(name)
-    if res['code'] != 200:
-        return jsonify({'status': 'NotFound', 'message': res['msg']}), 404
-
-    lxc_data = res.get('data', {})
-    raw_data = lxc_data.get('raw_lxd_info', {})
-    adapted_info = {
-        'name': raw_data.get('name'),
-        'status': raw_data.get('status'),
-        'status_code': raw_data.get('status_code'),
-        'type': raw_data.get('type'),
-        'architecture': raw_data.get('architecture'),
-        'ephemeral': raw_data.get('ephemeral'),
-        'created_at': raw_data.get('created_at'),
-        'profiles': raw_data.get('profiles', []),
-        'config': raw_data.get('config', {}),
-        'devices': raw_data.get('devices', {}),
-        'state': raw_data.get('state', {}),
-        'image_source': lxc_data.get('ImageSourceAlias'),
-        'description': raw_data.get('description'),
-        'ip': lxc_data.get('PublicIPv4', lxc_data.get('IP')),
-        'ipv6_list': lxc_data.get('IPv6List', []),
-        'public_ipv4': lxc_data.get('PublicIPv4'),
-        'public_ssh_port': lxc_data.get('PublicSSHPort'),
-        'total_ram_mb': lxc_data.get('TotalRam', 0),
-        'total_disk_mb': lxc_data.get('TotalDisk', 0),
-        'flow_limit_gb': lxc_data.get('Bandwidth', 0),
-        'live_data_available': raw_data.get('status') == 'Running',
-        'message': '数据来自LXD实时信息'
-    }
-    return jsonify(adapted_info)
-
-@app.route('/container/<name>/stats')
-@login_required
-def container_stats(name):
-    logger.debug(f"WebUI请求获取 {name} 的实时状态")
-    res = lxc.get_container_realtime_stats(name)
-    if res['code'] != 200:
-        return jsonify({'status': 'error', 'message': res['msg']}), res.get('code', 500)
-    return jsonify(res['data'])
-
-@app.route('/container/<name>/nat_rules', methods=['GET'])
-@login_required
-def list_nat_rules(name):
-    logger.info(f"WebUI请求获取 {name} 的端口转发规则")
-    res = lxc.list_nat_rules(name)
-    if res['code'] != 200:
-        return jsonify({'status': 'error', 'message': res['msg']}), 500
-
-    adapted_rules = []
-    for rule in res.get('data', []):
-        adapted_rules.append({
-            'id': rule.get('ID'),
-            'host_port': rule.get('Dport'),
-            'container_port': rule.get('Sport'),
-            'protocol': rule.get('Dtype').lower(),
-            'ip_at_creation': 'N/A',
-            'created_at': datetime.datetime.now().isoformat()
-        })
-    return jsonify({'status': 'success', 'rules': adapted_rules})
-
-@app.route('/container/nat_rule/<rule_id>', methods=['DELETE'])
-@login_required
-def delete_nat_rule(rule_id):
-    logger.info(f"WebUI请求删除端口转发规则ID: {rule_id}")
-    rules_metadata = _load_iptables_rules_metadata()
-    rule_to_delete = next((rule for rule in rules_metadata if rule.get('rule_id') == rule_id), None)
-
-    if not rule_to_delete:
-        return jsonify({'status': 'error', 'message': '未在元数据中找到该规则ID'}), 404
-
-    hostname = rule_to_delete.get('hostname')
-    dtype = rule_to_delete.get('dtype')
-    dport = rule_to_delete.get('dport')
-    sport = rule_to_delete.get('sport')
-    ip_at_creation = rule_to_delete.get('container_ip')
-
-    result = lxc.delete_nat_rule_via_iptables(hostname, dtype, dport, sport, ip_at_creation)
-    return jsonify(adapt_response(result))
-
-# === Routes for External API (lxdserver.php) ===
+# === API Routes ===
 
 @app.route('/api/check', methods=['GET'])
 @api_key_required
@@ -451,12 +192,91 @@ def api_addport():
     dtype = request.form.get('dtype')
     dport = request.form.get('dport')
     sport = request.form.get('sport')
+    remark = request.form.get('remark', '')  # 获取备注参数，默认为空
 
     if not all([hostname, dtype, dport, sport]):
         logger.warning(f"API /api/addport 调用缺少参数. Hostname: {hostname}, dtype: {dtype}, dport: {dport}, sport: {sport}. Form: {request.form}, Args: {request.args}")
         return jsonify({'code': 400, 'msg': '缺少hostname, dtype, dport, 或 sport参数'}), 400
-    logger.info(f"API请求addport for: {hostname}, {dtype}:{dport}->{sport}")
-    return jsonify(lxc.add_nat_rule_via_iptables(hostname, dtype, dport, sport))
+    logger.info(f"API请求addport for: {hostname}, {dtype}:{dport}->{sport}, 备注: {remark}")
+    return jsonify(lxc.add_nat_rule_via_iptables(hostname, dtype, dport, sport, remark))
+
+@app.route('/api/addport/batch', methods=['POST'])
+@api_key_required
+def api_addport_batch():
+    """
+    批量添加NAT转发规则 - 性能优化版本
+    
+    请求体 (JSON):
+    {
+        "hostname": "container-name",
+        "rules": [
+            {"dport": 10000, "sport": 8000, "dtype": "tcp"},
+            {"dport": 10000, "sport": 8000, "dtype": "udp"},
+            {"dport": 10001, "sport": 8001, "dtype": "tcp"},
+            ...
+        ],
+        "remark": "备注信息（可选）"
+    }
+    
+    返回:
+    {
+        "code": 200/207/403/404/409/500,
+        "msg": "批量添加成功！共添加 10 条规则",
+        "data": {
+            "success": 10,
+            "failed": 0,
+            "details": [
+                {"rule": "TCP 10000->8000", "status": "success"},
+                ...
+            ]
+        }
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            logger.warning("API /api/addport/batch 调用未提供JSON数据")
+            return jsonify({'code': 400, 'msg': '请求体必须是JSON格式'}), 400
+        
+        hostname = data.get('hostname')
+        rules = data.get('rules', [])
+        remark = data.get('remark', '')
+        
+        # 参数验证
+        if not hostname:
+            logger.warning("API /api/addport/batch 调用缺少hostname参数")
+            return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+        
+        if not rules or not isinstance(rules, list):
+            logger.warning(f"API /api/addport/batch 调用rules参数无效: {rules}")
+            return jsonify({'code': 400, 'msg': 'rules参数必须是非空数组'}), 400
+        
+        if len(rules) > 50:  # 安全限制，防止一次性添加过多规则
+            logger.warning(f"API /api/addport/batch 调用规则数量过多: {len(rules)}")
+            return jsonify({'code': 400, 'msg': f'单次批量添加最多支持50条规则，当前: {len(rules)}条'}), 400
+        
+        # 验证每条规则的格式
+        for idx, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                return jsonify({'code': 400, 'msg': f'规则 #{idx+1} 格式错误，必须是对象'}), 400
+            if not all(k in rule for k in ['dtype', 'dport', 'sport']):
+                return jsonify({'code': 400, 'msg': f'规则 #{idx+1} 缺少必要字段 (dtype, dport, sport)'}), 400
+        
+        logger.info(f"API批量添加NAT规则: {hostname}, 规则数: {len(rules)}, 备注: {remark}")
+        result = lxc.add_nat_rules_batch(hostname, rules, remark)
+        
+        # 根据返回的code设置HTTP状态码
+        http_status = 200
+        if result.get('code') == 207:  # Multi-Status
+            http_status = 200  # 仍然返回200，但code字段为207表示部分成功
+        elif result.get('code') >= 400:
+            http_status = result.get('code')
+        
+        return jsonify(result), http_status
+        
+    except Exception as e:
+        logger.error(f"API /api/addport/batch 发生异常: {e}", exc_info=True)
+        return jsonify({'code': 500, 'msg': f'服务器内部错误: {str(e)}'}), 500
 
 @app.route('/api/delport', methods=['POST'])
 @api_key_required
@@ -496,34 +316,24 @@ def api_reset_flow():
 
         logger.info(f"API请求重置容器 {hostname} 的流量")
 
-        # 获取容器当前流量统计
+        # 检查容器是否存在
         container_info = lxc.get_container_info(hostname)
         if container_info['code'] != 200:
             return jsonify({'code': 404, 'msg': '容器未找到或无法获取信息'})
 
-        # 获取LXD容器对象以读取网络统计
-        container = lxc._get_container_or_error(hostname)
-        if not container:
-            return jsonify({'code': 404, 'msg': '容器不存在'})
-
-        # 获取当前网络统计
-        state = container.state()
-        current_bytes_received = 0
-        current_bytes_sent = 0
-
-        if state.network:
-            for nic_name, nic_data in state.network.items():
-                if 'counters' in nic_data:
-                    current_bytes_received += nic_data['counters'].get('bytes_received', 0)
-                    current_bytes_sent += nic_data['counters'].get('bytes_sent', 0)
-
-        # 执行流量重置
-        if flow_mgr.reset_container_flow(
-            hostname,
-            current_bytes_received,
-            current_bytes_sent,
-            reset_type='manual'
-        ):
+        # 使用新系统重置流量（V2 不需要传递字节数，会自动读取 iptables）
+        if flow_mgr.reset_container_flow(hostname, reset_type='manual'):
+            # 如果容器被封禁，解除封禁
+            from iptables_manager import IptablesManager
+            iptables_mgr = IptablesManager()
+            
+            # 检查是否被封禁
+            container_usage = flow_mgr.get_container_usage(hostname)
+            if container_usage and container_usage.get('is_blocked'):
+                iptables_mgr.unblock_container(hostname)
+                flow_mgr.set_container_blocked(hostname, False)
+                logger.info(f"容器 {hostname} 已解封")
+            
             return jsonify({'code': 200, 'msg': '流量重置成功'})
         else:
             return jsonify({'code': 500, 'msg': '流量重置失败'})
@@ -547,41 +357,65 @@ def api_flow_info():
 
     logger.info(f"API请求获取容器 {hostname} 的流量管理信息")
 
-    flow_info = flow_mgr.get_container_flow_info(hostname)
+    # 使用新系统 V2 的 get_container_usage 方法
+    flow_info = flow_mgr.get_container_usage(hostname)
     if flow_info:
-        # 获取容器当前流量统计
+        # V2 返回的数据结构：
+        # {
+        #   'hostname': str,
+        #   'used_gb': float,
+        #   'limit_gb': int,
+        #   'is_blocked': bool,
+        #   'usage_percent': float,
+        #   'next_reset_date': str,
+        #   'created_date': str
+        # }
+        
+        # 为了保持API兼容性，添加一些额外字段
         try:
-            container = lxc._get_container_or_error(hostname)
-            if container:
-                state = container.state()
-                current_bytes_received = 0
-                current_bytes_sent = 0
-
-                if state.network:
-                    for nic_name, nic_data in state.network.items():
-                        if 'counters' in nic_data:
-                            current_bytes_received += nic_data['counters'].get('bytes_received', 0)
-                            current_bytes_sent += nic_data['counters'].get('bytes_sent', 0)
-
-                # 计算当前周期使用量
-                current_usage_gb = flow_mgr.calculate_current_period_usage(
-                    hostname, current_bytes_received, current_bytes_sent
-                )
-
-                # 添加实时流量信息
-                flow_info['current_bytes_received'] = current_bytes_received
-                flow_info['current_bytes_sent'] = current_bytes_sent
-                flow_info['current_usage_gb'] = current_usage_gb
-                flow_info['current_total_bytes'] = current_bytes_received + current_bytes_sent
-
+            from iptables_manager import IptablesManager
+            iptables_mgr = IptablesManager()
+            
+            # 获取 iptables 实时统计
+            traffic_stats = iptables_mgr.get_traffic_stats(hostname)
+            flow_info['current_bytes_received'] = traffic_stats['bytes_received']
+            flow_info['current_bytes_sent'] = traffic_stats['bytes_sent']
+            flow_info['current_total_bytes'] = traffic_stats['bytes_received'] + traffic_stats['bytes_sent']
+            
         except Exception as e:
-            logger.error(f"获取容器 {hostname} 当前流量统计失败: {e}")
-            flow_info['current_usage_gb'] = 0
-            flow_info['error'] = f"无法获取当前流量: {e}"
+            logger.error(f"获取容器 {hostname} iptables 统计失败: {e}")
+            flow_info['current_bytes_received'] = 0
+            flow_info['current_bytes_sent'] = 0
+            flow_info['current_total_bytes'] = 0
+            flow_info['error'] = f"无法获取 iptables 统计: {e}"
 
-        # 获取重置历史
-        reset_history = flow_mgr.get_flow_reset_history(hostname, 5)
-        flow_info['reset_history'] = reset_history
+        # 注意：V2 系统没有 get_flow_reset_history 方法
+        # 如果需要重置历史，需要直接查询数据库
+        try:
+            import sqlite3
+            with sqlite3.connect(flow_mgr.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT reset_date, reset_type, flow_used_gb, created_at
+                    FROM flow_reset_history_v2
+                    WHERE hostname = ?
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """, (hostname,)).fetchall()
+                
+                reset_history = []
+                for row in rows:
+                    reset_history.append({
+                        'reset_date': row['reset_date'],
+                        'reset_type': row['reset_type'],
+                        'flow_used_gb': row['flow_used_gb'],
+                        'created_at': row['created_at']
+                    })
+                flow_info['reset_history'] = reset_history
+        except Exception as e:
+            logger.error(f"获取重置历史失败: {e}")
+            flow_info['reset_history'] = []
+
         return jsonify({'code': 200, 'msg': '获取成功', 'data': flow_info})
     else:
         return jsonify({'code': 404, 'msg': '容器未在流量管理系统中注册'})
@@ -679,7 +513,145 @@ def api_batch_update_cpu_limit():
         return jsonify({'code': 500, 'msg': f'服务器内部错误: {e}'}), 500
 
 
+# === 磁盘 I/O 限制管理 API ===
+
+@app.route('/api/disk/io/update', methods=['POST'])
+@api_key_required
+def api_update_disk_io_limit():
+    """
+    更新容器的磁盘 I/O 读写速度限制
+    
+    请求体 JSON:
+        {
+            "hostname": "容器名",
+            "disk_read": 100,    # 磁盘读取限制 (MB/s)，0 表示移除限制
+            "disk_write": 50     # 磁盘写入限制 (MB/s)，0 表示移除限制
+        }
+    """
+    try:
+        payload = request.json
+        if not payload:
+            return jsonify({'code': 400, 'msg': '无效的请求体'}), 400
+        
+        hostname = payload.get('hostname')
+        if not hostname:
+            logger.warning("API /api/disk/io/update 调用缺少 hostname 参数")
+            return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+        
+        disk_read = payload.get('disk_read')
+        disk_write = payload.get('disk_write')
+        
+        if disk_read is None and disk_write is None:
+            logger.warning("API /api/disk/io/update 调用未指定任何限制参数")
+            return jsonify({'code': 400, 'msg': '至少需要指定 disk_read 或 disk_write 参数'}), 400
+        
+        # 验证 disk_read 参数
+        if disk_read is not None:
+            try:
+                disk_read = int(disk_read)
+                if disk_read < 0:
+                    return jsonify({'code': 400, 'msg': 'disk_read 必须大于或等于 0'}), 400
+                if disk_read > 10000:
+                    return jsonify({'code': 400, 'msg': 'disk_read 超出合理范围 (0-10000 MB/s)'}), 400
+            except (ValueError, TypeError):
+                return jsonify({'code': 400, 'msg': f'disk_read 必须是整数'}), 400
+        
+        # 验证 disk_write 参数
+        if disk_write is not None:
+            try:
+                disk_write = int(disk_write)
+                if disk_write < 0:
+                    return jsonify({'code': 400, 'msg': 'disk_write 必须大于或等于 0'}), 400
+                if disk_write > 10000:
+                    return jsonify({'code': 400, 'msg': 'disk_write 超出合理范围 (0-10000 MB/s)'}), 400
+            except (ValueError, TypeError):
+                return jsonify({'code': 400, 'msg': f'disk_write 必须是整数'}), 400
+        
+        logger.info(f"API请求更新容器 {hostname} 磁盘 I/O 限制: 读={disk_read}MB/s, 写={disk_write}MB/s")
+        return jsonify(lxc.update_disk_io_limit(hostname, disk_read, disk_write))
+        
+    except Exception as e:
+        logger.error(f"处理 /api/disk/io/update 时发生意外错误: {e}", exc_info=True)
+        return jsonify({'code': 500, 'msg': f'服务器内部错误: {e}'}), 500
+
+
+@app.route('/api/disk/io/get', methods=['GET'])
+@api_key_required
+def api_get_disk_io_limit():
+    """
+    获取容器的磁盘 I/O 限制信息
+    
+    参数:
+        hostname: 容器名
+    """
+    try:
+        hostname = request.args.get('hostname')
+        if not hostname:
+            logger.warning("API /api/disk/io/get 调用缺少 hostname 参数")
+            return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+        
+        logger.info(f"API请求获取容器 {hostname} 磁盘 I/O 限制信息")
+        return jsonify(lxc.get_disk_io_limit(hostname))
+        
+    except Exception as e:
+        logger.error(f"处理 /api/disk/io/get 时发生意外错误: {e}", exc_info=True)
+        return jsonify({'code': 500, 'msg': f'服务器内部错误: {e}'}), 500
+
+
+@app.route('/api/internal/cache/invalidate', methods=['POST'])
+@api_key_required
+def api_invalidate_cache():
+    """
+    内部API：使NAT元数据缓存失效
+    
+    用于系统恢复后强制刷新缓存，确保缓存与实际iptables规则同步
+    主要在restore_on_boot.py恢复完成后调用
+    
+    Returns:
+        JSON响应
+    """
+    try:
+        from lxc_manager import _metadata_manager
+        
+        # 使缓存失效
+        _metadata_manager.invalidate()
+        logger.info("NAT元数据缓存已通过API失效")
+        
+        return jsonify({
+            'code': 200, 
+            'msg': '缓存已失效，下次查询将重新加载'
+        })
+    except Exception as e:
+        logger.error(f"缓存失效失败: {e}")
+        return jsonify({'code': 500, 'msg': f'缓存失效失败: {str(e)}'}), 500
+
+
+def startup_checks():
+    """启动时的检查和初始化"""
+    try:
+        from lxc_manager import _metadata_manager
+        
+        # 使NAT元数据缓存失效，确保与恢复后的系统状态同步
+        # 这在宿主机重启后非常重要，避免缓存中的数据与实际iptables不一致
+        _metadata_manager.invalidate()
+        logger.info("✓ 启动检查完成：NAT元数据缓存已失效")
+    except Exception as e:
+        logger.warning(f"启动检查失败（非致命）: {e}")
+
+
 if __name__ == '__main__':
-    logger.info(f"启动LXD网页管理器，监听端口: {app_config.http_port}")
-    logger.info("请使用您的TOKEN作为密码登录WebUI，或作为API Key用于外部模块调用。")
-    app.run(host='0.0.0.0', port=app_config.http_port, debug=(app_config.log_level == 'DEBUG'))
+    try:
+        # 执行启动检查
+        startup_checks()
+        
+        logger.info(f"启动LXD API服务器，监听端口: {app_config.http_port}")
+        logger.info("请使用您的TOKEN作为API Key（HTTP Header: apikey）用于外部模块调用。")
+        
+        # 启动Flask服务
+        app.run(host='0.0.0.0', port=app_config.http_port, debug=(app_config.log_level == 'DEBUG'))
+    except KeyboardInterrupt:
+        logger.info("服务已停止")
+    except Exception as e:
+        logger.critical(f"服务启动失败: {e}")
+        import sys
+        sys.exit(1)

@@ -11,27 +11,190 @@ import time
 import datetime
 import ipaddress
 import socket
+import threading
+from filelock import FileLock, Timeout
 
 logger = logging.getLogger(__name__)
 
-IPTABLES_RULES_METADATA_FILE = 'iptables_rules.json'
+IPTABLES_RULES_METADATA_FILE = 'nat_rules_metadata.json'  # NAT规则元数据（列表格式）
+
+
+class NATMetadataManager:
+    """
+    NAT规则元数据管理器（单例模式）
+    
+    功能：
+    - 内存缓存（减少文件I/O）
+    - 文件锁（保证并发安全）
+    - 索引加速（按容器名快速查询）
+    """
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        """单例模式：确保全局只有一个实例"""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        """初始化管理器"""
+        if self._initialized:
+            return
+        
+        self.metadata_file = IPTABLES_RULES_METADATA_FILE
+        self.lock_file = IPTABLES_RULES_METADATA_FILE + '.lock'
+        self.cache = []
+        self.cache_by_hostname = {}  # 索引：按容器名
+        self.cache_time = 0
+        self.cache_ttl = 5  # 缓存5秒（平衡性能和数据新鲜度）
+        self._initialized = True
+        logger.info("NAT元数据管理器已初始化（带缓存+文件锁）")
+    
+    def load(self, force_reload=False):
+        """
+        加载元数据（带缓存）
+        
+        Args:
+            force_reload: 是否强制重新加载（忽略缓存）
+        
+        Returns:
+            规则列表
+        """
+        now = time.time()
+        
+        # 检查缓存是否有效
+        if not force_reload and self.cache and (now - self.cache_time) < self.cache_ttl:
+            logger.debug(f"使用缓存的元数据（{len(self.cache)}条规则，缓存命中）")
+            return self.cache.copy()
+        
+        # 从文件加载（使用文件锁保证并发安全）
+        file_lock = FileLock(self.lock_file, timeout=10)
+        try:
+            with file_lock:
+                if os.path.exists(self.metadata_file):
+                    with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        
+                        # 验证数据格式：必须是列表
+                        if not isinstance(data, list):
+                            logger.error(f"元数据文件格式错误（不是列表）：{type(data)}，清空缓存")
+                            self.cache = []
+                            self.cache_time = now
+                            self._build_index()
+                            # 备份损坏的文件
+                            try:
+                                backup_file = self.metadata_file + '.corrupted'
+                                os.rename(self.metadata_file, backup_file)
+                                logger.info(f"已将损坏的元数据文件备份到: {backup_file}")
+                            except:
+                                pass
+                            return []
+                        
+                        self.cache = data
+                        self.cache_time = now
+                        self._build_index()
+                        logger.debug(f"从文件加载元数据（{len(self.cache)}条规则）")
+                        return self.cache.copy()
+                else:
+                    self.cache = []
+                    self.cache_time = now
+                    self._build_index()
+                    return []
+        except Timeout:
+            logger.error("加载元数据超时：无法获取文件锁")
+            # 返回缓存数据（即使过期）
+            return self.cache.copy() if self.cache else []
+        except Exception as e:
+            logger.error(f"加载iptables规则元数据失败: {e}")
+            # 返回缓存数据（即使过期）
+            return self.cache.copy() if self.cache else []
+    
+    def save(self, rules):
+        """
+        保存元数据（带锁）
+        
+        Args:
+            rules: 规则列表
+        """
+        file_lock = FileLock(self.lock_file, timeout=10)
+        try:
+            with file_lock:
+                with open(self.metadata_file, 'w', encoding='utf-8') as f:
+                    json.dump(rules, f, indent=4, ensure_ascii=False)
+                # 更新缓存
+                self.cache = rules.copy()
+                self.cache_time = time.time()
+                self._build_index()
+                logger.debug(f"保存元数据到文件（{len(rules)}条规则）")
+        except Timeout:
+            logger.error("保存元数据超时：无法获取文件锁")
+            raise
+        except Exception as e:
+            logger.error(f"保存iptables规则元数据失败: {e}")
+            raise
+    
+    def _build_index(self):
+        """构建索引：按容器名分组"""
+        self.cache_by_hostname = {}
+        for rule in self.cache:
+            # 确保rule是字典类型
+            if not isinstance(rule, dict):
+                logger.warning(f"跳过无效的规则（不是字典类型）: {rule}")
+                continue
+            hostname = rule.get('hostname')
+            if hostname:
+                if hostname not in self.cache_by_hostname:
+                    self.cache_by_hostname[hostname] = []
+                self.cache_by_hostname[hostname].append(rule)
+        logger.debug(f"构建索引：{len(self.cache_by_hostname)}个容器")
+    
+    def get_by_hostname(self, hostname):
+        """
+        按容器名获取规则（O(1)查询）
+        
+        Args:
+            hostname: 容器名
+        
+        Returns:
+            该容器的规则列表
+        """
+        # 确保缓存是最新的
+        if time.time() - self.cache_time >= self.cache_ttl:
+            self.load(force_reload=True)
+        
+        return self.cache_by_hostname.get(hostname, []).copy()
+    
+    def invalidate(self):
+        """使缓存失效（强制下次重新加载）"""
+        self.cache_time = 0
+        logger.debug("缓存已失效")
+
+
+# 全局单例实例
+_metadata_manager = NATMetadataManager()
+
 
 def _load_iptables_rules_metadata():
-    try:
-        if os.path.exists(IPTABLES_RULES_METADATA_FILE):
-            with open(IPTABLES_RULES_METADATA_FILE, 'r') as f:
-                return json.load(f)
-        return []
-    except Exception as e:
-        logger.error(f"加载iptables规则元数据失败: {e}")
-        return []
+    """
+    加载iptables规则元数据（使用缓存）
+    
+    这是向后兼容的包装函数
+    """
+    return _metadata_manager.load()
+
 
 def _save_iptables_rules_metadata(rules):
-    try:
-        with open(IPTABLES_RULES_METADATA_FILE, 'w') as f:
-            json.dump(rules, f, indent=4)
-    except Exception as e:
-        logger.error(f"保存iptables规则元数据失败: {e}")
+    """
+    保存iptables规则元数据（使用锁）
+    
+    这是向后兼容的包装函数
+    """
+    _metadata_manager.save(rules)
 
 class LXCManager:
     def __init__(self):
@@ -47,12 +210,41 @@ class LXCManager:
         """获取流量管理器实例（延迟初始化）"""
         if self.flow_manager is None:
             try:
-                from flow_manager import FlowManager
-                self.flow_manager = FlowManager()
+                from flow_manager_v2 import FlowManagerV2
+                self.flow_manager = FlowManagerV2()
             except Exception as e:
                 logger.warning(f"无法初始化流量管理器: {e}")
                 return None
         return self.flow_manager
+
+    def list_all_containers(self):
+        """
+        获取所有容器的名称列表
+        
+        Returns:
+            list: 容器名称列表
+        """
+        try:
+            all_containers = self.client.containers.all()
+            return [c.name for c in all_containers]
+        except LXDAPIException as e:
+            logger.error(f"获取容器列表时发生LXD API错误: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"获取容器列表失败: {e}")
+            return []
+    
+    def get_container_hostname(self, container_name):
+        """
+        获取容器的 hostname（在LXD中，容器名就是hostname）
+        
+        Args:
+            container_name: 容器名称
+            
+        Returns:
+            str: hostname（容器名）
+        """
+        return container_name
 
     def _get_container_or_error(self, hostname):
         try:
@@ -63,42 +255,77 @@ class LXCManager:
             logger.error(f"获取容器 {hostname} 时发生LXD API错误: {e}")
             raise ValueError(f"获取容器时LXD API错误: {e}")
 
-    def _get_container_ip(self, container):
+    def _get_container_ip(self, container, prefer_ipv6=False):
+        """
+        获取容器的IP地址（IPv4或IPv6）
+        
+        Args:
+            container: 容器对象
+            prefer_ipv6: 是否优先返回IPv6地址（默认优先IPv4）
+            
+        Returns:
+            IP地址字符串，或None
+        """
         target_bridge = app_config.network_bridge
         nic_name_on_target_bridge = None
         container_name = container.name
-        logger.debug(f"开始为容器 {container_name} 获取IP地址，目标网桥: {target_bridge}")
+        logger.debug(f"开始为容器 {container_name} 获取IP地址，目标网桥: {target_bridge}, 优先IPv6: {prefer_ipv6}")
+        
+        # 查找连接到网桥的设备
         for device_name, device_config in container.devices.items():
             if device_config.get('type') == 'nic' and device_config.get('network') == target_bridge:
                 nic_name_on_target_bridge = device_name
                 logger.debug(f"容器 {container_name} 上找到连接到网桥 {target_bridge} 的接口设备: {nic_name_on_target_bridge}")
                 break
+        
         try:
             state = container.state()
+            ipv4_addr = None
+            ipv6_addr = None
+            
             # 优先使用与目标网桥匹配的设备
             if nic_name_on_target_bridge and state.network and nic_name_on_target_bridge in state.network:
                 interface_state = state.network[nic_name_on_target_bridge]
                 logger.debug(f"容器 {container_name} 接口 {nic_name_on_target_bridge} 的状态: {interface_state}")
                 for addr_info in interface_state.get('addresses', []):
                     if addr_info.get('family') == 'inet' and addr_info.get('scope') == 'global':
-                        ip_address = addr_info['address']
-                        logger.info(f"为容器 {container_name} 在接口 {nic_name_on_target_bridge} 上找到IP: {ip_address}")
-                        return ip_address
-                logger.warning(f"容器 {container_name} 在接口 {nic_name_on_target_bridge} 上没有找到inet global IP地址。地址列表: {interface_state.get('addresses')}")
+                        ipv4_addr = addr_info['address']
+                    elif addr_info.get('family') == 'inet6' and addr_info.get('scope') == 'global':
+                        ipv6_addr = addr_info['address']
             else:
-                # 兼容：设备定义可能在 profile 中（container.devices 空），直接遍历状态里所有接口找第一个全局 IPv4
+                # 兼容：设备定义可能在 profile 中，直接遍历状态里所有接口
                 if not nic_name_on_target_bridge:
-                    logger.warning(f"容器 {container_name} 未在 devices 中找到连接到网桥 {target_bridge} 的设备，尝试从状态中直接解析 IP。设备列表: {container.devices}")
+                    logger.warning(f"容器 {container_name} 未在 devices 中找到连接到网桥 {target_bridge} 的设备，尝试从状态中直接解析 IP")
                 if state.network:
                     for if_name, if_state in state.network.items():
+                        if if_name == 'lo':  # 跳过loopback
+                            continue
                         for addr_info in if_state.get('addresses', []):
                             if addr_info.get('family') == 'inet' and addr_info.get('scope') == 'global':
-                                ip_address = addr_info['address']
-                                logger.info(f"为容器 {container_name} 在接口 {if_name} 上找到IP(兼容模式): {ip_address}")
-                                return ip_address
-                logger.warning(f"容器 {container_name} 的网络状态中未解析到全局 IPv4。当前网络状态: {state.network}")
+                                ipv4_addr = addr_info['address']
+                            elif addr_info.get('family') == 'inet6' and addr_info.get('scope') == 'global':
+                                ipv6_addr = addr_info['address']
+            
+            # 根据配置返回合适的地址
+            if prefer_ipv6:
+                if ipv6_addr:
+                    logger.info(f"为容器 {container_name} 找到IPv6地址: {ipv6_addr}")
+                    return ipv6_addr
+                elif ipv4_addr:
+                    logger.info(f"为容器 {container_name} 找到IPv4地址(IPv6不可用): {ipv4_addr}")
+                    return ipv4_addr
+            else:
+                if ipv4_addr:
+                    logger.info(f"为容器 {container_name} 找到IPv4地址: {ipv4_addr}")
+                    return ipv4_addr
+                elif ipv6_addr:
+                    logger.info(f"为容器 {container_name} 找到IPv6地址(IPv4不可用): {ipv6_addr}")
+                    return ipv6_addr
+                    
+            logger.warning(f"容器 {container_name} 没有找到可用的全局IP地址")
         except LXDAPIException as e:
             logger.error(f"获取容器 {container_name} 网络状态时发生LXD API错误: {e}")
+        
         logger.warning(f"未能为容器 {container_name} 获取IP地址")
         return None
 
@@ -108,6 +335,25 @@ class LXCManager:
     def _set_user_metadata(self, container, key, value):
         container.config[f"user.{key}"] = str(value)
         container.save(wait=True)
+
+    def _set_user_metadata_no_save(self, container, key, value):
+        """设置用户元数据但不保存（用于批量操作）"""
+        container.config[f"user.{key}"] = str(value)
+
+    def _delete_user_metadata(self, container, key):
+        """删除容器的用户元数据"""
+        config_key = f"user.{key}"
+        if config_key in container.config:
+            del container.config[config_key]
+            container.save(wait=True)
+            logger.debug(f"已删除容器元数据: {config_key}")
+
+    def _delete_user_metadata_no_save(self, container, key):
+        """删除容器的用户元数据但不保存（用于批量操作）"""
+        config_key = f"user.{key}"
+        if config_key in container.config:
+            del container.config[config_key]
+            logger.debug(f"已删除容器元数据: {config_key}")
 
     def _run_shell_command_for_iptables(self, command_args):
         full_command = ['sudo', 'iptables'] + command_args
@@ -250,6 +496,58 @@ class LXCManager:
             logger.debug(f"IPv6自愈失败({hostname}): {e}")
 
 
+    def _get_ssh_port(self, hostname, container):
+        """
+        安全地获取容器的SSH端口
+        
+        Args:
+            hostname: 容器主机名
+            container: 容器对象
+            
+        Returns:
+            SSH端口号（字符串）或 None
+        """
+        try:
+            # 方法1: 从NAT元数据中查找SSH端口（TCP 22）
+            rules_metadata = _load_iptables_rules_metadata()
+            
+            # 确保返回的是列表
+            if isinstance(rules_metadata, dict):
+                # 如果是字典，获取所有值
+                rules_list = list(rules_metadata.values())
+            elif isinstance(rules_metadata, list):
+                rules_list = rules_metadata
+            else:
+                rules_list = []
+            
+            # 在规则中查找SSH端口
+            for rule in rules_list:
+                if not isinstance(rule, dict):
+                    continue
+                if (rule.get('hostname') == hostname and 
+                    rule.get('dtype', '').lower() == 'tcp' and 
+                    str(rule.get('sport')) == '22'):
+                    return str(rule.get('dport'))
+            
+            # 方法2: 从容器设备中查找SSH代理端口
+            if container and hasattr(container, 'devices'):
+                for device_name, device_info in container.devices.items():
+                    if not isinstance(device_info, dict):
+                        continue
+                    if (device_info.get('type') == 'proxy' and 
+                        device_name.startswith('nat-') and 
+                        ':22' in device_info.get('connect', '')):
+                        listen = device_info.get('listen', '')
+                        if listen:
+                            parts = listen.split(':')
+                            if len(parts) >= 3:
+                                return parts[2]
+            
+            return None
+        except Exception as e:
+            logger.warning(f"获取容器 {hostname} SSH端口失败: {e}")
+            return None
+    
     def get_container_info(self, hostname):
         container = self._get_container_or_error(hostname)
         if not container:
@@ -297,11 +595,16 @@ class LXCManager:
             flow_manager = self._get_flow_manager()
             if flow_manager:
                 try:
-                    used_flow_gb = flow_manager.calculate_current_period_usage(
-                        hostname, bytes_received_total, bytes_sent_total
-                    )
+                    # FlowManagerV2 使用 get_container_usage() 方法
+                    usage_info = flow_manager.get_container_usage(hostname)
+                    if usage_info and 'used_gb' in usage_info:
+                        used_flow_gb = usage_info['used_gb']
+                    else:
+                        # 如果没有在数据库中找到记录，使用原始计算
+                        bytes_total = bytes_received_total + bytes_sent_total
+                        used_flow_gb = round(bytes_total / (1024*1024*1024), 2)
                 except Exception as e:
-                    logger.warning(f"计算容器 {hostname} 周期流量失败，使用原始计算: {e}")
+                    logger.warning(f"从流量管理系统获取容器 {hostname} 流量失败，使用原始计算: {e}")
                     bytes_total = bytes_received_total + bytes_sent_total
                     used_flow_gb = round(bytes_total / (1024*1024*1024), 2)
             else:
@@ -358,19 +661,25 @@ class LXCManager:
             else:
                 public_ipv4 = app_config.nat_listen_ip  # 传统模式，返回 NAT IP
             
+            # 获取磁盘 I/O 限制
+            disk_read_limit = root_device.get('limits.read', '不限')
+            disk_write_limit = root_device.get('limits.write', '不限')
+            
             data = {
                 'Hostname': hostname, 'Status': lxc_status,
                 'UsedCPU': cpu_percent,
                 'CPUCores': cpu_cores, # Added for lxdserver module
                 'TotalRam': total_ram_mb, 'UsedRam': used_ram_mb,
                 'TotalDisk': total_disk_mb, 'UsedDisk': used_disk_mb,
+                'DiskReadLimit': disk_read_limit,  # 新增：磁盘读取限制
+                'DiskWriteLimit': disk_write_limit,  # 新增：磁盘写入限制
                 'IP': self._get_container_ip(container) or 'N/A',
                 'IPv6List': public_ipv6,
                 'PublicIPv4': public_ipv4,  # 修改：IPv6-Only 模式下返回 None
                 'IPv4Mode': ipv4_mode,  # 新增：返回 IPv4 模式（BRIDGE 或 OFF）
                 'IPv6Mode': ipv6_mode,  # 修改：使用变量
                 'PublicIPv6NAT': (str(getattr(app_config, 'nat_listen_ipv6', '')).split('/')[0] if ipv6_mode == 'NAT66' and getattr(app_config, 'nat_listen_ipv6', None) else ''),
-                'PublicSSHPort': (lambda: (next((str(r.get('dport')) for r in _load_iptables_rules_metadata() if r.get('hostname') == hostname and r.get('dtype','').lower()=='tcp' and str(r.get('sport'))=='22'), None)) or (next((d.get('listen','').split(':')[2] for name,d in container.devices.items() if d.get('type')=='proxy' and name.startswith('nat-') and d.get('connect','').endswith(':22')), None)) )(),
+                'PublicSSHPort': self._get_ssh_port(hostname, container),
                 'Bandwidth': flow_limit_gb,
                 'UseBandwidth': used_flow_gb, # For lxdserver module
                 'UseBandwidth_GB': used_flow_gb, # For new web UI
@@ -490,8 +799,10 @@ class LXCManager:
             }
             logger.info(f"容器 {hostname} 将配置 IPv4 网卡（BRIDGE 模式）")
         elif ipv4_mode == 'OFF':
-            # IPv6-Only 模式：不添加 eth0
-            logger.info(f"容器 {hostname} 不配置 IPv4 网卡（IPV4_MODE=OFF）")
+            # IPv6-Only 模式：明确禁用 eth0（覆盖 profile 中的配置）
+            # 使用 type: "none" 来禁用从 default profile 继承的网卡
+            container_config_obj['devices']['eth0'] = {'type': 'none'}
+            logger.info(f"容器 {hostname} 禁用 IPv4 网卡（IPV4_MODE=OFF，type=none）")
         
         # CPU 使用率百分比限制（可选）
         if params.get('cpu_percent'):
@@ -512,6 +823,23 @@ class LXCManager:
                 logger.info(f"容器 {hostname} 设置带宽限制: 上行 {params.get('up')}Mbps, 下行 {params.get('down')}Mbps")
         elif params.get('up') and params.get('down') and ipv4_mode == 'OFF':
             logger.warning(f"容器 {hostname} 处于 IPv6-Only 模式，带宽限制参数将被忽略")
+        
+        # 硬盘读写限制（可选）
+        if params.get('disk_read') or params.get('disk_write'):
+            try:
+                if params.get('disk_read'):
+                    disk_read = int(params.get('disk_read'))
+                    if disk_read > 0:
+                        container_config_obj['devices']['root']['limits.read'] = f"{disk_read}MB"
+                        logger.info(f"容器 {hostname} 设置磁盘读取限制: {disk_read}MB/s")
+                
+                if params.get('disk_write'):
+                    disk_write = int(params.get('disk_write'))
+                    if disk_write > 0:
+                        container_config_obj['devices']['root']['limits.write'] = f"{disk_write}MB"
+                        logger.info(f"容器 {hostname} 设置磁盘写入限制: {disk_write}MB/s")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"无效的磁盘读写限制参数，错误: {e}")
 
         container_to_cleanup_on_error = None
         try:
@@ -558,18 +886,29 @@ class LXCManager:
             self._set_user_metadata(container, 'nat_acl_limit', params.get('ports', 0))
             self._set_user_metadata(container, 'flow_limit_gb', params.get('bandwidth', 0))
             self._set_user_metadata(container, 'disk_size_mb', params.get('disk', '1024'))
+            # 保存磁盘读写限制到元数据
+            if params.get('disk_read'):
+                self._set_user_metadata(container, 'disk_read_mb', params.get('disk_read'))
+            if params.get('disk_write'):
+                self._set_user_metadata(container, 'disk_write_mb', params.get('disk_write'))
 
-            # 在启动前先注册到流量管理系统（基准值为0）
-            flow_manager = self._get_flow_manager()
-            if flow_manager:
-                try:
-                    flow_limit_gb = int(params.get('bandwidth', 0))
-                    if flow_manager.register_container(hostname, flow_limit_gb):
-                        logger.info(f"容器 {hostname} 已注册到流量管理系统")
-                    else:
-                        logger.warning(f"容器 {hostname} 注册到流量管理系统失败")
-                except Exception as e:
-                    logger.error(f"注册容器 {hostname} 到流量管理系统时发生异常: {e}")
+            # 注册到新的流量管理系统 V2
+            try:
+                from flow_manager_v2 import FlowManagerV2
+                from iptables_manager import IptablesManager
+                
+                flow_limit_gb = int(params.get('bandwidth', 0))
+                logger.info(f"准备注册容器 {hostname} 到流量管理系统 V2，限制: {flow_limit_gb}GB")
+                
+                # 注册到数据库（容器还未启动，IP可能还没分配）
+                flow_mgr_v2 = FlowManagerV2()
+                if flow_mgr_v2.register_container(hostname, flow_limit_gb=flow_limit_gb):
+                    logger.info(f"✓ 容器 {hostname} 已注册到流量管理系统 V2")
+                else:
+                    logger.warning(f"⚠ 容器 {hostname} 注册到流量管理系统 V2 失败")
+                    
+            except Exception as e:
+                logger.error(f"注册容器 {hostname} 到流量管理系统 V2 时发生异常: {e}")
 
             logger.info(f"容器 {hostname} 配置完成，开始启动...")
             container.start(wait=True)
@@ -577,6 +916,17 @@ class LXCManager:
 
             logger.info(f"容器 {hostname} 已启动，等待网络稳定...")
             time.sleep(10)  # 减少等待时间
+
+            # 容器启动后，添加 iptables 规则
+            try:
+                logger.info(f"为容器 {hostname} 添加 iptables 流量统计规则...")
+                iptables_mgr = IptablesManager()
+                if iptables_mgr.ensure_container_rules(hostname):
+                    logger.info(f"✓ 容器 {hostname} iptables 规则已添加")
+                else:
+                    logger.warning(f"⚠ 容器 {hostname} iptables 规则添加失败")
+            except Exception as e:
+                logger.error(f"为容器 {hostname} 添加 iptables 规则时发生异常: {e}")
 
             logger.info(f"容器 {hostname} 网络稳定，准备设置初始密码...")
 
@@ -610,35 +960,118 @@ class LXCManager:
                     logger.error(f"为容器 {hostname} 设置初始密码时发生LXD API错误: {e_passwd}")
                 except Exception as e_passwd_generic:
                     logger.error(f"为容器 {hostname} 设置初始密码时发生未知错误: {e_passwd_generic}", exc_info=True)
-            try:
-                ssh_external_port_min = 10000
-                ssh_external_port_max = 65535
-                random_ssh_dport = random.randint(ssh_external_port_min, ssh_external_port_max)
-                logger.info(f"尝试为容器 {hostname} 自动添加 SSH (端口 22) 的 NAT 规则，使用外部端口 {random_ssh_dport}")
-
-                container_ip_for_nat = None
-                nat_add_attempts = 0
-                while not container_ip_for_nat and nat_add_attempts < 3:
-                    container_ip_for_nat = self._get_container_ip(container)
-                    if container_ip_for_nat: break
-                    logger.warning(f"为容器 {hostname} 获取IP失败 (尝试 {nat_add_attempts+1}/3)，等待后重试...")
-                    time.sleep(5)
-                    nat_add_attempts += 1
-
-                if not container_ip_for_nat:
-                    logger.error(f"为容器 {hostname} 自动添加 SSH NAT 规则失败：多次尝试后仍无法获取容器IP地址。")
-                else:
-                    add_ssh_rule_result = self.add_nat_rule_via_iptables(hostname, 'tcp', str(random_ssh_dport), '22')
-                    if add_ssh_rule_result.get('code') == 200:
-                        logger.info(f"成功为容器 {hostname} 自动添加 SSH NAT 规则: 外部端口 {random_ssh_dport} -> 内部端口 22")
-                    elif add_ssh_rule_result.get('code') == 409:
-                        logger.warning(f"尝试为容器 {hostname} 自动添加 SSH NAT 规则失败：外部端口 {random_ssh_dport} 已被此容器的其他规则使用。可尝试重新创建或手动添加其他端口。")
+            
+            # 配置 DNS（IPv6-Only 模式需要）
+            ipv4_mode = getattr(app_config, 'ipv4_mode', 'BRIDGE').upper()
+            ipv6_mode = getattr(app_config, 'ipv6_mode', 'OFF').upper()
+            
+            if ipv4_mode == 'OFF' and ipv6_mode == 'ROUTED':
+                # IPv6-Only 模式：配置 IPv6 DNS
+                try:
+                    logger.info(f"为容器 {hostname} 配置 IPv6 DNS...")
+                    dns_config_cmd = [
+                        'bash', '-c',
+                        'echo -e "nameserver 2a01:4f8:c2c:123f::1\\nnameserver 2a00:1098:2c::1\\nnameserver 2a01:4f9:c010:3f02::1" > /etc/resolv.conf'
+                    ]
+                    result = container.execute(dns_config_cmd)
+                    if result.exit_code == 0:
+                        logger.info(f"✓ 容器 {hostname} DNS 配置成功")
                     else:
-                        logger.error(f"为容器 {hostname} 自动添加 SSH NAT 规则失败。外部端口: {random_ssh_dport}, 原因: {add_ssh_rule_result.get('msg')}")
-            except Exception as e_ssh_nat:
-                logger.error(f"为容器 {hostname} 自动添加 SSH NAT 规则时发生异常: {str(e_ssh_nat)}", exc_info=True)
+                        logger.warning(f"容器 {hostname} DNS 配置失败: {result.stderr}")
+                except Exception as e_dns:
+                    logger.warning(f"为容器 {hostname} 配置 DNS 失败: {e_dns}")
+            
+            # IPv6-Only 模式：禁用 ICMP（如果配置了）
+            if ipv4_mode == 'OFF' and ipv6_mode == 'ROUTED':
+                disable_icmp = params.get('disable_icmp', False)
+                if disable_icmp:
+                    try:
+                        logger.info(f"为容器 {hostname} 禁用 ICMP (ping)...")
+                        
+                        # 安装 iptables-persistent 用于持久化规则（静默安装）
+                        install_cmd = [
+                            'bash', '-c',
+                            'export DEBIAN_FRONTEND=noninteractive && '
+                            'apt-get update -qq && '
+                            'apt-get install -y -qq iptables-persistent > /dev/null 2>&1 || true'
+                        ]
+                        container.execute(install_cmd)
+                        
+                        # 配置 ip6tables 规则：阻止入站 ICMPv6 echo-request (ping)
+                        icmp_cmd = [
+                            'bash', '-c',
+                            'ip6tables -I INPUT -p ipv6-icmp --icmpv6-type echo-request -j DROP && '
+                            'ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true'
+                        ]
+                        result = container.execute(icmp_cmd)
+                        
+                        if result.exit_code == 0:
+                            logger.info(f"✓ 容器 {hostname} ICMP 已禁用（无法被 ping）")
+                        else:
+                            stderr_msg = result.stderr if isinstance(result.stderr, str) else (result.stderr.decode('utf-8', errors='ignore') if result.stderr else '')
+                            logger.warning(f"容器 {hostname} ICMP 禁用可能失败: {stderr_msg}")
+                    except Exception as e_icmp:
+                        logger.warning(f"为容器 {hostname} 禁用 ICMP 失败: {e_icmp}")
+            
+            # 自动添加 SSH NAT 规则（仅在 IPv4 BRIDGE 模式下）
+            # IPv6-Only ROUTED 模式下容器有独立公网 IPv6，无需 NAT
+            
+            if ipv4_mode == 'BRIDGE':
+                # IPv4 BRIDGE 模式：容器使用私有 IPv4（10.x.x.x），需要 NAT
+                try:
+                    ssh_external_port_min = 10000
+                    ssh_external_port_max = 65535
+                    random_ssh_dport = random.randint(ssh_external_port_min, ssh_external_port_max)
+                    logger.info(f"尝试为容器 {hostname} 自动添加 SSH NAT 规则（IPv4 BRIDGE 模式），使用外部端口 {random_ssh_dport}")
 
-            return {'code': 200, 'msg': '容器创建成功'}
+                    container_ip_for_nat = None
+                    nat_add_attempts = 0
+                    while not container_ip_for_nat and nat_add_attempts < 5:
+                        container_ip_for_nat = self._get_container_ip(container, prefer_ipv6=False)
+                        if container_ip_for_nat: 
+                            logger.info(f"成功获取容器 {hostname} IP: {container_ip_for_nat}")
+                            break
+                        logger.warning(f"为容器 {hostname} 获取IP失败 (尝试 {nat_add_attempts+1}/5)，等待后重试...")
+                        time.sleep(3)
+                        nat_add_attempts += 1
+
+                    if not container_ip_for_nat:
+                        logger.error(f"为容器 {hostname} 自动添加 SSH NAT 规则失败：多次尝试后仍无法获取容器IP地址。")
+                    else:
+                        add_ssh_rule_result = self.add_nat_rule_via_iptables(hostname, 'tcp', str(random_ssh_dport), '22')
+                        if add_ssh_rule_result.get('code') == 200:
+                            logger.info(f"✓ 成功为容器 {hostname} 自动添加 SSH NAT 规则: 外部端口 {random_ssh_dport} -> 内部端口 22 (容器IP: {container_ip_for_nat})")
+                        elif add_ssh_rule_result.get('code') == 409:
+                            logger.warning(f"尝试为容器 {hostname} 自动添加 SSH NAT 规则失败：外部端口 {random_ssh_dport} 已被此容器的其他规则使用。")
+                        else:
+                            logger.error(f"为容器 {hostname} 自动添加 SSH NAT 规则失败。外部端口: {random_ssh_dport}, 原因: {add_ssh_rule_result.get('msg')}")
+                except Exception as e_ssh_nat:
+                    logger.error(f"为容器 {hostname} 自动添加 SSH NAT 规则时发生异常: {str(e_ssh_nat)}", exc_info=True)
+            elif ipv4_mode == 'OFF':
+                # IPv6-Only 模式：容器有独立 IPv6 地址，直接访问，无需 NAT
+                ipv6_mode = getattr(app_config, 'ipv6_mode', 'OFF').upper()
+                if ipv6_mode == 'ROUTED':
+                    logger.info(f"容器 {hostname} 为 IPv6-Only ROUTED 模式，无需创建 NAT 规则，请直接使用 IPv6 地址访问")
+                else:
+                    logger.warning(f"容器 {hostname} 为 IPv6-Only 模式但 IPv6 未启用 ROUTED，可能无法从外部访问")
+
+            # 创建成功后，获取容器完整信息并返回（包含 IPv6 地址等）
+            try:
+                container_info = self.get_container_info(hostname)
+                if container_info.get('code') == 200:
+                    # 合并创建成功消息和容器信息
+                    return {
+                        'code': 200,
+                        'msg': '容器创建成功',
+                        'data': container_info.get('data', {})
+                    }
+                else:
+                    # 容器创建成功，但获取信息失败（不影响整体成功状态）
+                    logger.warning(f"容器 {hostname} 创建成功，但获取详细信息失败")
+                    return {'code': 200, 'msg': '容器创建成功'}
+            except Exception as e_info:
+                logger.warning(f"容器 {hostname} 创建成功，但获取详细信息时发生异常: {e_info}")
+                return {'code': 200, 'msg': '容器创建成功'}
         except (LXDAPIException, Exception) as e:
             error_type_msg = "LXD API错误" if isinstance(e, LXDAPIException) else "内部错误"
             logger.error(f"创建容器 {hostname} 过程中发生{error_type_msg}: {str(e)}", exc_info=True)
@@ -654,16 +1087,25 @@ class LXCManager:
                      logger.error(f"尝试清理部分创建的容器 {container_to_cleanup_on_error.name} 时失败: {e_cleanup}")
             return {'code': 500, 'msg': f'{error_type_msg} (create): {str(e)}'}
 
-    def add_nat_rule_via_iptables(self, hostname, dtype, dport, sport):
+    def add_nat_rule_via_iptables(self, hostname, dtype, dport, sport, remark=''):
         container = self._get_container_or_error(hostname)
         if not container: return {'code': 404, 'msg': '容器未找到'}
 
-        logger.info(f"为容器 {hostname} 通过LXD proxy设备添加端口转发规则: {dtype} {dport} -> {sport}")
+        logger.info(f"为容器 {hostname} 通过LXD proxy设备添加端口转发规则: {dtype} {dport} -> {sport}, 备注: {remark}")
 
         # 检查规则限制和已有规则
         limit = int(self._get_user_metadata(container, 'nat_acl_limit', 0))
         rules_metadata = _load_iptables_rules_metadata()
-        current_host_rules_count = sum(1 for r in rules_metadata if r.get('hostname') == hostname)
+        
+        # 确保返回的是列表格式（兼容字典和列表）
+        if isinstance(rules_metadata, dict):
+            rules_list = list(rules_metadata.values())
+        elif isinstance(rules_metadata, list):
+            rules_list = rules_metadata
+        else:
+            rules_list = []
+        
+        current_host_rules_count = sum(1 for r in rules_list if isinstance(r, dict) and r.get('hostname') == hostname)
 
         is_ssh_rule = (str(sport) == '22' and dtype.lower() == 'tcp')
         if not is_ssh_rule and limit > 0 and current_host_rules_count >= limit:
@@ -882,10 +1324,12 @@ class LXCManager:
 
                     #
 
+                    # IPv6 地址需要用方括号括起来
+                    connect_addr = f'[{container_ip}]' if ':' in container_ip else container_ip
                     container.devices[f"{device_name}-v6"] = {
                         'type': 'proxy',
                         'listen': f'{proto}:[{v6_host}]:{dport}',
-                        'connect': f'{proto}:{container_ip}:{sport}',
+                        'connect': f'{proto}:{connect_addr}:{sport}',
                         'bind': 'host'
                     }
                     container.save(wait=True)
@@ -965,10 +1409,12 @@ class LXCManager:
                         logger.warning(msg6)
                         return {'code': 400, 'msg': msg6}
 
+                # IPv6 地址需要用方括号括起来（IPv6-Only 模式下也可能连接到 IPv6）
+                connect_addr = f'[{container_ip}]' if ':' in container_ip else container_ip
                 container.devices[device_name] = {
                     'type': 'proxy',
                     'listen': f'{proto}:{v4_host}:{dport}',
-                    'connect': f'{proto}:{container_ip}:{sport}',
+                    'connect': f'{proto}:{connect_addr}:{sport}',
                     'bind': 'host'
                 }
                 container.save(wait=True)
@@ -1045,7 +1491,8 @@ class LXCManager:
                 'dport': str(dport),
                 'sport': str(sport),
                 'container_ip': container_ip,
-                'rule_id': rule_comment
+                'rule_id': rule_comment,
+                'remark': str(remark) if remark else ''
             }
             rules_metadata.append(new_rule_meta)
             _save_iptables_rules_metadata(rules_metadata)
@@ -1061,6 +1508,275 @@ class LXCManager:
 
     # === End of restored functions ===
 
+    def add_nat_rules_batch(self, hostname, rules, remark=''):
+        """
+        批量添加NAT转发规则 - 性能优化版本
+        
+        参数:
+            hostname: 容器名称
+            rules: 规则列表 [{'dport': 10000, 'sport': 8000, 'dtype': 'tcp'}, ...]
+            remark: 备注信息（所有规则共享）
+        
+        返回:
+            {'code': 200/207/403/404/409/500, 'msg': '...', 'data': {...}}
+        
+        性能优化:
+        - 只查询容器一次
+        - 只获取IP一次
+        - 批量验证规则冲突
+        - 批量添加LXD设备
+        - 一次性保存容器配置
+        - 一次性保存元数据文件
+        """
+        # 1. 前置验证（只执行一次）
+        container = self._get_container_or_error(hostname)
+        if not container:
+            return {'code': 404, 'msg': '容器未找到'}
+        
+        logger.info(f"为容器 {hostname} 批量添加 {len(rules)} 条NAT转发规则, 备注: {remark}")
+        
+        # 获取容器 IP（批量添加只获取一次，提高性能）
+        container_ip = self._get_container_ip(container)
+        if not container_ip:
+            logger.error(f"为容器 {hostname} 批量添加端口转发规则失败: 无法获取内部IP")
+            return {'code': 500, 'msg': '无法获取容器内部IP地址'}
+        
+        # 2. 检查规则限制（只查询一次）
+        limit = int(self._get_user_metadata(container, 'nat_acl_limit', 0))
+        rules_metadata = _load_iptables_rules_metadata()
+        
+        # 确保返回的是列表格式（兼容字典和列表）
+        if isinstance(rules_metadata, dict):
+            rules_list = list(rules_metadata.values())
+        elif isinstance(rules_metadata, list):
+            rules_list = rules_metadata
+        else:
+            rules_list = []
+        
+        current_host_rules_count = sum(1 for r in rules_list if isinstance(r, dict) and r.get('hostname') == hostname)
+        
+        # 计算非SSH规则数量
+        new_rules_count = sum(1 for rule in rules if not (str(rule.get('sport')) == '22' and rule.get('dtype', '').lower() == 'tcp'))
+        
+        if limit > 0 and (current_host_rules_count + new_rules_count) > limit:
+            logger.warning(f"容器 {hostname} 批量添加将超出规则限制 (当前:{current_host_rules_count}, 新增:{new_rules_count}, 限制:{limit})")
+            return {
+                'code': 403, 
+                'msg': f'批量添加将超出规则限制 (当前:{current_host_rules_count}条, 新增:{new_rules_count}条, 限制:{limit}条)'
+            }
+        
+        # 3. 批量验证（检查端口冲突）
+        existing_keys = {
+            (r.get('hostname'), r.get('dtype', '').lower(), str(r.get('dport'))) 
+            for r in rules_metadata
+        }
+        
+        conflicts = []
+        for rule in rules:
+            dtype = str(rule.get('dtype', '')).lower()
+            dport = str(rule.get('dport', ''))
+            key = (hostname, dtype, dport)
+            if key in existing_keys:
+                conflicts.append(f"{dtype.upper()} {dport}")
+        
+        if conflicts:
+            logger.warning(f"容器 {hostname} 批量添加发现端口冲突: {', '.join(conflicts[:5])}")
+            conflict_msg = ', '.join(conflicts[:5])
+            if len(conflicts) > 5:
+                conflict_msg += f' 等{len(conflicts)}个'
+            return {
+                'code': 409, 
+                'msg': f'以下端口规则已存在: {conflict_msg}'
+            }
+        
+        # 获取配置信息（只查询一次）
+        v4_host = app_config.nat_listen_ip or '0.0.0.0'
+        ipv6_enabled = getattr(app_config, 'ipv6_mode', 'OFF') == 'NAT66'
+        v6_host = None
+        if ipv6_enabled:
+            v6_host = getattr(app_config, 'nat_listen_ipv6', None) or '::'
+            v6_host = str(v6_host).split('/')[0].strip('[]') if v6_host else '::'
+        
+        # 3.5. 端口占用预检测（在批量添加前检测所有端口）
+        logger.info(f"批量添加前检测 {len(rules)} 个端口的占用情况...")
+        
+        def _check_port_available(ip, port, proto, ipv6=False):
+            """快速检测端口是否可用"""
+            import socket, errno
+            family = socket.AF_INET6 if ipv6 else socket.AF_INET
+            stype = socket.SOCK_STREAM if proto == 'tcp' else socket.SOCK_DGRAM
+            
+            try:
+                s = socket.socket(family, stype)
+                bind_ip = ip.strip('[]') if ipv6 else ip
+                s.bind((bind_ip, int(port)))
+                if stype == socket.SOCK_STREAM:
+                    s.listen(1)
+                s.close()
+                return True, ''
+            except OSError as e:
+                if getattr(e, 'errno', None) == errno.EADDRINUSE:
+                    return False, f"{ip}:{port} already in use"
+                # 其他错误（如地址不可用）认为端口可用，留给LXD处理
+                return True, ''
+            except Exception:
+                # 其他异常认为端口可用，留给LXD处理
+                return True, ''
+        
+        # 检测所有端口（先检测再添加，确保原子性）
+        for rule in rules:
+            dtype = str(rule.get('dtype', '')).lower()
+            dport = int(rule.get('dport', 0))
+            
+            # 检测IPv4端口
+            available, msg = _check_port_available(v4_host, dport, dtype, False)
+            if not available:
+                logger.warning(f"端口 {dtype.upper()} {dport} 已被占用: {msg}")
+                return {
+                    'code': 409,
+                    'msg': f'端口 {dtype.upper()} {dport} 已被占用，无法批量添加'
+                }
+            
+            # 检测IPv6端口（如启用）
+            if ipv6_enabled:
+                available, msg = _check_port_available(v6_host, dport, dtype, True)
+                if not available:
+                    logger.warning(f"IPv6端口 {dtype.upper()} {dport} 已被占用: {msg}")
+                    return {
+                        'code': 409,
+                        'msg': f'IPv6端口 {dtype.upper()} {dport} 已被占用，无法批量添加'
+                    }
+        
+        logger.info(f"所有 {len(rules)} 个端口检测通过，开始批量添加...")
+        
+        # 4. 批量添加
+        success_count = 0
+        failed_count = 0
+        details = []
+        new_metadata = []
+        
+        for rule in rules:
+            try:
+                dtype = str(rule.get('dtype', '')).lower()
+                dport = int(rule.get('dport', 0))
+                sport = int(rule.get('sport', 0))
+                
+                # 参数验证
+                if not dtype or dtype not in ['tcp', 'udp']:
+                    raise ValueError(f"无效的协议类型: {dtype}")
+                if not (10000 <= dport <= 65535):
+                    raise ValueError(f"外网端口 {dport} 超出范围 (10000-65535)")
+                if not (1 <= sport <= 65535):
+                    raise ValueError(f"内网端口 {sport} 超出范围 (1-65535)")
+                
+                proto = dtype
+                device_name = f"nat-{proto}-{dport}"
+                rule_comment = f'lxd_controller_nat_{hostname}_{proto}_{dport}'
+                
+                # 清理可能遗留的旧设备
+                cleaned = False
+                for dev in (device_name, f"{device_name}-v6", f"{device_name}-v4"):
+                    if dev in container.devices:
+                        del container.devices[dev]
+                        cleaned = True
+                        logger.debug(f"批量添加前移除旧设备 {dev}")
+                
+                # IPv6 地址需要用方括号括起来
+                connect_addr = f'[{container_ip}]' if ':' in container_ip else container_ip
+                
+                # 添加IPv4设备
+                container.devices[f"{device_name}-v4"] = {
+                    'type': 'proxy',
+                    'listen': f'{proto}:{v4_host}:{dport}',
+                    'connect': f'{proto}:{connect_addr}:{sport}',
+                    'bind': 'host'
+                }
+                
+                # 添加IPv6设备（如果启用）
+                if ipv6_enabled:
+                    container.devices[f"{device_name}-v6"] = {
+                        'type': 'proxy',
+                        'listen': f'{proto}:[{v6_host}]:{dport}',
+                        'connect': f'{proto}:{connect_addr}:{sport}',
+                        'bind': 'host'
+                    }
+                
+                # 记录元数据
+                new_metadata.append({
+                    'hostname': hostname,
+                    'dtype': proto,
+                    'dport': str(dport),
+                    'sport': str(sport),
+                    'container_ip': container_ip,
+                    'rule_id': rule_comment,
+                    'remark': str(remark) if remark else ''
+                })
+                
+                success_count += 1
+                details.append({
+                    'rule': f"{proto.upper()} {dport}->{sport}", 
+                    'status': 'success'
+                })
+                logger.debug(f"批量添加规则准备: {proto.upper()} {dport}->{sport}")
+                
+            except Exception as e:
+                failed_count += 1
+                error_msg = str(e)
+                details.append({
+                    'rule': f"{rule.get('dtype', '').upper()} {rule.get('dport', '?')}->{rule.get('sport', '?')}", 
+                    'status': 'failed', 
+                    'error': error_msg
+                })
+                logger.error(f"批量添加规则失败: {error_msg}")
+        
+        # 5. 一次性保存容器配置
+        if success_count > 0:
+            try:
+                logger.info(f"批量保存容器 {hostname} 的 {success_count} 条NAT规则配置...")
+                container.save(wait=True)
+                logger.info(f"容器 {hostname} 配置保存成功")
+            except Exception as e:
+                logger.error(f"批量保存容器配置失败: {e}")
+                return {
+                    'code': 500, 
+                    'msg': f'批量添加失败: 保存容器配置时出错: {str(e)}'
+                }
+        
+        # 6. 一次性更新元数据文件
+        if new_metadata:
+            try:
+                rules_metadata.extend(new_metadata)
+                _save_iptables_rules_metadata(rules_metadata)
+                logger.info(f"批量保存 {len(new_metadata)} 条规则元数据成功")
+            except Exception as e:
+                logger.error(f"批量保存元数据失败: {e}")
+                # 元数据保存失败不应导致整个操作失败，因为规则已经生效
+                logger.warning(f"NAT规则已生效，但元数据保存失败，可能导致显示不准确")
+        
+        # 7. 返回结果
+        if failed_count == 0:
+            logger.info(f"容器 {hostname} 批量添加NAT规则成功: {success_count} 条规则")
+            return {
+                'code': 200,
+                'msg': f'批量添加成功！共添加 {success_count} 条规则',
+                'data': {
+                    'success': success_count,
+                    'failed': failed_count,
+                    'details': details
+                }
+            }
+        else:
+            logger.warning(f"容器 {hostname} 批量添加NAT规则部分成功: 成功 {success_count}, 失败 {failed_count}")
+            return {
+                'code': 207,  # Multi-Status
+                'msg': f'批量添加完成。成功: {success_count}条, 失败: {failed_count}条',
+                'data': {
+                    'success': success_count,
+                    'failed': failed_count,
+                    'details': details
+                }
+            }
+
     def delete_container(self, hostname):
         container = self._get_container_or_error(hostname)
         if not container: return {'code': 404, 'msg': '容器未找到'}
@@ -1069,8 +1785,17 @@ class LXCManager:
 
             logger.info(f"删除容器 {hostname} 前，清理其所有 NAT 规则")
             rules_metadata_snapshot = _load_iptables_rules_metadata()
+            
+            # 确保返回的是列表格式（兼容字典和列表）
+            if isinstance(rules_metadata_snapshot, dict):
+                rules_list = list(rules_metadata_snapshot.values())
+            elif isinstance(rules_metadata_snapshot, list):
+                rules_list = rules_metadata_snapshot
+            else:
+                rules_list = []
+            
             rules_for_this_host_to_delete = [
-                rule for rule in rules_metadata_snapshot if rule.get('hostname') == hostname
+                rule for rule in rules_list if isinstance(rule, dict) and rule.get('hostname') == hostname
             ]
 
             if not rules_for_this_host_to_delete:
@@ -1318,8 +2043,18 @@ class LXCManager:
         # 保存原先的SSH端口信息用于后续恢复
         original_ssh_port = None
         rules_metadata_snapshot_reinstall = _load_iptables_rules_metadata()
-        for rule in rules_metadata_snapshot_reinstall:
-            if (rule.get('hostname') == hostname and
+        
+        # 确保返回的是列表格式（兼容字典和列表）
+        if isinstance(rules_metadata_snapshot_reinstall, dict):
+            rules_list_reinstall = list(rules_metadata_snapshot_reinstall.values())
+        elif isinstance(rules_metadata_snapshot_reinstall, list):
+            rules_list_reinstall = rules_metadata_snapshot_reinstall
+        else:
+            rules_list_reinstall = []
+        
+        for rule in rules_list_reinstall:
+            if (isinstance(rule, dict) and
+                rule.get('hostname') == hostname and
                 rule.get('dtype', '').lower() == 'tcp' and
                 str(rule.get('sport')) == '22'):
                 original_ssh_port = rule.get('dport')
@@ -1677,19 +2412,19 @@ fi
             logger.warning(f"获取NAT规则失败: 容器 {hostname} 不存在")
             return {'code': 404, 'msg': '容器未找到', 'data': []}
 
-        # 从元数据中读取规则
-        rules_metadata = _load_iptables_rules_metadata()
+        # 使用索引快速获取该容器的规则（O(1)查询，性能提升）
+        rules_for_hostname = _metadata_manager.get_by_hostname(hostname)
         container_rules = []
 
-        # 遍历元数据中的规则
-        for rule_meta in rules_metadata:
-            if rule_meta.get('hostname') == hostname:
-                container_rules.append({
-                    'Dtype': rule_meta.get('dtype','').upper(),  # 使用大写开头的键名
-                    'Dport': rule_meta.get('dport'),            # 使用大写开头的键名
-                    'Sport': rule_meta.get('sport'),            # 使用大写开头的键名
-                    'ID': rule_meta.get('rule_id', f"iptables-{rule_meta.get('dtype')}-{rule_meta.get('dport')}")  # 使用大写开头的键名
-                })
+        # 转换格式
+        for rule_meta in rules_for_hostname:
+            container_rules.append({
+                'Dtype': rule_meta.get('dtype','').upper(),  # 使用大写开头的键名
+                'Dport': rule_meta.get('dport'),            # 使用大写开头的键名
+                'Sport': rule_meta.get('sport'),            # 使用大写开头的键名
+                'ID': rule_meta.get('rule_id', f"iptables-{rule_meta.get('dtype')}-{rule_meta.get('dport')}"),  # 使用大写开头的键名
+                'Remark': rule_meta.get('remark', '')       # 添加备注字段
+            })
 
         # 同时检查容器设备是否有proxy设备（用于兼容性检查）
         for device_name, device_info in container.devices.items():
@@ -1732,13 +2467,23 @@ fi
 
         # 加载元数据
         rules_metadata = _load_iptables_rules_metadata()
+        
+        # 确保返回的是列表格式（兼容字典和列表）
+        if isinstance(rules_metadata, dict):
+            rules_list = list(rules_metadata.values())
+        elif isinstance(rules_metadata, list):
+            rules_list = rules_metadata
+        else:
+            rules_list = []
+        
         rule_comment_to_use = f'lxd_controller_nat_{hostname}_{dtype.lower()}_{dport}'
         device_name = f"nat-{dtype.lower()}-{dport}"
 
         # 找到要删除的规则元数据
         rule_to_delete_meta = None
-        for idx, rule_meta_item in enumerate(rules_metadata):
-            if (rule_meta_item.get('hostname') == hostname and
+        for idx, rule_meta_item in enumerate(rules_list):
+            if (isinstance(rule_meta_item, dict) and
+                rule_meta_item.get('hostname') == hostname and
                 rule_meta_item.get('dtype', '').lower() == dtype.lower() and
                 str(rule_meta_item.get('dport')) == str(dport) and
                 str(rule_meta_item.get('sport')) == str(sport)):
@@ -1876,6 +2621,122 @@ fi
         except Exception as e:
             logger.error(f"获取容器 {hostname} CPU 限制时发生错误: {e}", exc_info=True)
             return {'code': 500, 'msg': f'获取 CPU 限制失败: {str(e)}'}
+
+    def update_disk_io_limit(self, hostname, disk_read=None, disk_write=None):
+        """
+        更新容器的磁盘 I/O 限制
+        
+        参数:
+            hostname: 容器主机名
+            disk_read: 磁盘读取限制 (MB/s)，0 或 None 表示移除限制
+            disk_write: 磁盘写入限制 (MB/s)，0 或 None 表示移除限制
+        
+        返回:
+            {'code': 200/404/500, 'msg': '...'}
+        """
+        try:
+            container = self._get_container_or_error(hostname)
+            if not container:
+                return {'code': 404, 'msg': f'容器 {hostname} 不存在'}
+            
+            changes = []
+            
+            # 更新读取限制
+            if disk_read is not None:
+                try:
+                    disk_read_int = int(disk_read)
+                    if disk_read_int < 0:
+                        return {'code': 400, 'msg': 'disk_read 必须大于或等于 0'}
+                    if disk_read_int > 10000:
+                        return {'code': 400, 'msg': 'disk_read 超出合理范围 (0-10000 MB/s)'}
+                    
+                    if disk_read_int > 0:
+                        container.devices['root']['limits.read'] = f"{disk_read_int}MB"
+                        changes.append(f"读取限制: {disk_read_int}MB/s")
+                        logger.info(f"设置容器 {hostname} 磁盘读取限制: {disk_read_int}MB/s")
+                        # 同步更新元数据（不保存，最后统一保存）
+                        self._set_user_metadata_no_save(container, 'disk_read_mb', str(disk_read_int))
+                    else:
+                        if 'limits.read' in container.devices['root']:
+                            del container.devices['root']['limits.read']
+                            changes.append("读取限制: 已移除")
+                            logger.info(f"移除容器 {hostname} 磁盘读取限制")
+                            # 同步删除元数据（不保存，最后统一保存）
+                            self._delete_user_metadata_no_save(container, 'disk_read_mb')
+                except (ValueError, TypeError):
+                    return {'code': 400, 'msg': f'disk_read 必须是有效的整数，当前值: {disk_read}'}
+            
+            # 更新写入限制
+            if disk_write is not None:
+                try:
+                    disk_write_int = int(disk_write)
+                    if disk_write_int < 0:
+                        return {'code': 400, 'msg': 'disk_write 必须大于或等于 0'}
+                    if disk_write_int > 10000:
+                        return {'code': 400, 'msg': 'disk_write 超出合理范围 (0-10000 MB/s)'}
+                    
+                    if disk_write_int > 0:
+                        container.devices['root']['limits.write'] = f"{disk_write_int}MB"
+                        changes.append(f"写入限制: {disk_write_int}MB/s")
+                        logger.info(f"设置容器 {hostname} 磁盘写入限制: {disk_write_int}MB/s")
+                        # 同步更新元数据（不保存，最后统一保存）
+                        self._set_user_metadata_no_save(container, 'disk_write_mb', str(disk_write_int))
+                    else:
+                        if 'limits.write' in container.devices['root']:
+                            del container.devices['root']['limits.write']
+                            changes.append("写入限制: 已移除")
+                            logger.info(f"移除容器 {hostname} 磁盘写入限制")
+                            # 同步删除元数据（不保存，最后统一保存）
+                            self._delete_user_metadata_no_save(container, 'disk_write_mb')
+                except (ValueError, TypeError):
+                    return {'code': 400, 'msg': f'disk_write 必须是有效的整数，当前值: {disk_write}'}
+            
+            if not changes:
+                return {'code': 400, 'msg': '没有指定要更新的限制'}
+            
+            container.save(wait=True)
+            msg = '磁盘 I/O 限制已更新: ' + ', '.join(changes)
+            return {'code': 200, 'msg': msg}
+            
+        except LXDAPIException as e:
+            logger.error(f"更新容器 {hostname} 磁盘 I/O 限制时发生 LXD API 错误: {e}")
+            return {'code': 500, 'msg': f'LXD API 错误: {e}'}
+        except Exception as e:
+            logger.error(f"更新容器 {hostname} 磁盘 I/O 限制时发生错误: {e}", exc_info=True)
+            return {'code': 500, 'msg': f'更新磁盘 I/O 限制失败: {str(e)}'}
+    
+    def get_disk_io_limit(self, hostname):
+        """
+        获取容器的磁盘 I/O 限制
+        
+        参数:
+            hostname: 容器主机名
+        
+        返回:
+            {'code': 200/404/500, 'msg': '...', 'data': {...}}
+        """
+        try:
+            container = self._get_container_or_error(hostname)
+            if not container:
+                return {'code': 404, 'msg': f'容器 {hostname} 不存在'}
+            
+            root_device = container.devices.get('root', {})
+            disk_read_limit = root_device.get('limits.read', '不限')
+            disk_write_limit = root_device.get('limits.write', '不限')
+            
+            data = {
+                'disk_read_limit': disk_read_limit,
+                'disk_write_limit': disk_write_limit
+            }
+            
+            return {'code': 200, 'msg': '获取成功', 'data': data}
+            
+        except LXDAPIException as e:
+            logger.error(f"获取容器 {hostname} 磁盘 I/O 限制时发生 LXD API 错误: {e}")
+            return {'code': 500, 'msg': f'LXD API 错误: {e}'}
+        except Exception as e:
+            logger.error(f"获取容器 {hostname} 磁盘 I/O 限制时发生错误: {e}", exc_info=True)
+            return {'code': 500, 'msg': f'获取磁盘 I/O 限制失败: {str(e)}'}
 
     def batch_update_cpu_limit(self, updates):
         """

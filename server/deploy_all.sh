@@ -84,7 +84,7 @@ check_root
 # ==========================================
 # 步骤 1: 安装 Python 依赖
 # ==========================================
-log_step "步骤 1/11: 安装 Python 依赖"
+log_step "步骤 1/5: 安装 Python 依赖"
 
 if [ -f "requirements.txt" ]; then
     log_info "安装 requirements.txt 中的依赖..."
@@ -98,9 +98,9 @@ else
 fi
 
 # ==========================================
-# 步骤 2-4: 网络配置
+# 步骤 2: 网络配置
 # ==========================================
-log_step "步骤 2-4/11: 网络配置"
+log_step "步骤 2/5: 网络配置"
 
 # 检测可用的网卡接口
 echo ""
@@ -178,6 +178,25 @@ while true; do
     fi
 done
 
+# 输入 IPv6 网卡接口名（可选）
+echo ""
+log_info "输入 IPv6 网卡接口名（如果与主网卡不同）"
+log_info "如果 IPv6 与 IPv4 使用相同网卡，请直接按 Enter 跳过"
+read -p "$(echo -e "${COLOR_YELLOW}IPv6 网卡接口名 [默认: $MAIN_INTERFACE]:${COLOR_NC} ")" IPV6_INTERFACE
+IPV6_INTERFACE=${IPV6_INTERFACE:-$MAIN_INTERFACE}
+
+if [ "$IPV6_INTERFACE" != "$MAIN_INTERFACE" ]; then
+    # 验证 IPv6 网卡是否存在
+    if ip link show "$IPV6_INTERFACE" >/dev/null 2>&1; then
+        log_ok "IPv6 网卡接口: $IPV6_INTERFACE ✓ (已验证存在)"
+    else
+        log_warn "警告: 网卡 '$IPV6_INTERFACE' 不存在于系统中，将使用主网卡"
+        IPV6_INTERFACE=$MAIN_INTERFACE
+    fi
+else
+    log_ok "IPv6 网卡接口: $IPV6_INTERFACE (与主网卡相同)"
+fi
+
 # 选择 IPv6 模式
 echo ""
 log_info "选择 IPv6 模式:"
@@ -216,12 +235,31 @@ while true; do
     esac
 done
 
+# IPv6-Only 模式选项（仅在启用 IPv6 ROUTED 模式时可用）
+IPV4_MODE="BRIDGE"  # 默认值
+if [ "$IPV6_MODE" = "ROUTED" ]; then
+    echo ""
+    log_info "是否启用 IPv6-Only 模式？"
+    log_info "启用后容器将只使用 IPv6 地址，不分配 IPv4 地址"
+    echo ""
+    
+    if ask_yes_no "启用 IPv6-Only 模式" "n"; then
+        IPV4_MODE="OFF"
+        log_ok "✓ 已启用 IPv6-Only 模式 (IPV4_MODE=OFF)"
+    else
+        IPV4_MODE="BRIDGE"
+        log_ok "✓ 使用标准模式 (IPv4+IPv6 双栈)"
+    fi
+fi
+
 # 创建配置文件
 log_info "生成网络配置..."
 cat > network_config.env << EOF
 # 网络配置文件
 MAIN_INTERFACE=$MAIN_INTERFACE
+IPV6_INTERFACE=$IPV6_INTERFACE
 IPV4_ADDRESS=$IPV4_ADDRESS
+IPV4_MODE=$IPV4_MODE
 IPV6_MODE=$IPV6_MODE
 IPV6_PREFIX=$IPV6_PREFIX
 NAT_LISTEN_IPV6=$NAT_LISTEN_IPV6
@@ -232,7 +270,7 @@ echo ""
 log_info "执行网络配置脚本..."
 if [ -f "network_setup.py" ]; then
     # 设置环境变量供 Python 脚本使用
-    export MAIN_INTERFACE IPV4_ADDRESS IPV6_MODE IPV6_PREFIX NAT_LISTEN_IPV6
+    export MAIN_INTERFACE IPV6_INTERFACE IPV4_ADDRESS IPV4_MODE IPV6_MODE IPV6_PREFIX NAT_LISTEN_IPV6
     
     if python3 network_setup.py; then
         log_ok "网络配置完成"
@@ -245,123 +283,41 @@ else
 fi
 
 # ==========================================
-# 步骤 5: 启用流量管理功能
+# 步骤 3: 部署 iptables 流量监控系统 V2
 # ==========================================
-log_step "步骤 5/11: 流量管理功能"
+log_step "步骤 3/5: 部署 iptables 流量监控系统 V2"
 
-if ask_yes_no "是否启用流量管理功能?" "y"; then
-    ENABLE_FLOW_MANAGEMENT=true
-    log_ok "将启用流量管理功能"
+if ask_yes_no "是否部署流量监控系统（iptables V2）?" "y"; then
+    log_info "开始部署流量监控系统..."
+    
+    # 检查部署脚本是否存在
+    if [ -f "deploy_iptables_flow.sh" ]; then
+        # 执行流量系统部署脚本
+        if bash deploy_iptables_flow.sh; then
+            log_ok "流量监控系统部署完成"
+            ENABLE_FLOW_MANAGEMENT=true
+        else
+            log_error "流量监控系统部署失败"
+            if ask_yes_no "是否继续部署其他组件?" "y"; then
+                log_warn "跳过流量监控系统，继续部署"
+                ENABLE_FLOW_MANAGEMENT=false
+            else
+                exit 1
+            fi
+        fi
+    else
+        log_error "未找到 deploy_iptables_flow.sh 脚本"
+        ENABLE_FLOW_MANAGEMENT=false
+    fi
 else
+    log_info "跳过流量监控系统部署"
     ENABLE_FLOW_MANAGEMENT=false
-    log_info "跳过流量管理功能"
 fi
 
 # ==========================================
-# 步骤 6: 创建流量管理表
+# 步骤 4: 配置滥用防护
 # ==========================================
-if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
-    log_step "步骤 6/11: 创建流量管理数据库"
-    
-    if ask_yes_no "是否创建/初始化流量管理数据库?" "y"; then
-        log_info "初始化流量管理数据库..."
-        
-        # 运行数据库升级工具（如果存在）
-        if [ -f "tools/upgrade_flow_database.py" ]; then
-            log_info "运行数据库升级工具..."
-            python3 tools/upgrade_flow_database.py
-        elif [ -f "upgrade_flow_database.py" ]; then
-            log_info "运行数据库升级工具..."
-            python3 upgrade_flow_database.py
-        fi
-        
-        # 初始化 FlowManager
-        python3 -c "
-from flow_manager import FlowManager
-fm = FlowManager()
-print('✅ 流量管理数据库初始化完成')
-" && log_ok "流量管理数据库创建成功"
-        
-        # 注册现有容器
-        log_info "注册现有容器到流量管理系统..."
-        if [ -f "flow_reset_scheduler.py" ]; then
-            python3 flow_reset_scheduler.py register
-            log_ok "容器注册完成"
-        fi
-    else
-        log_info "跳过数据库创建"
-    fi
-else
-    log_info "跳过流量管理数据库（功能未启用）"
-fi
-
-# ==========================================
-# 步骤 7: 验证部署
-# ==========================================
-if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
-    log_step "步骤 7/11: 验证流量管理部署"
-    
-    if ask_yes_no "是否验证流量管理部署?" "y"; then
-        log_info "运行部署验证..."
-        
-        # 检查数据库
-        if [ -f "flow_management.db" ]; then
-            log_ok "✓ 数据库文件存在"
-        else
-            log_warn "✗ 数据库文件不存在"
-        fi
-        
-        # 测试流量监控
-        if [ -f "test_flow_continuity.py" ]; then
-            log_info "测试流量连续性..."
-            python3 test_flow_continuity.py || log_warn "流量测试失败，但继续执行"
-        fi
-    else
-        log_info "跳过验证"
-    fi
-else
-    log_info "跳过验证（流量管理未启用）"
-fi
-
-# ==========================================
-# 步骤 8: 部署流量限制系统
-# ==========================================
-if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
-    log_step "步骤 8/11: 部署流量限制系统"
-    
-    if ask_yes_no "是否部署流量限制强制执行系统?" "y"; then
-        log_info "部署流量限制系统..."
-        
-        # 设置流量限制守护进程
-        if [ -f "setup_flow_limit_enforcement.sh" ]; then
-            bash setup_flow_limit_enforcement.sh
-            log_ok "流量限制系统部署完成"
-        else
-            log_warn "未找到 setup_flow_limit_enforcement.sh"
-        fi
-        
-        # 或者使用生产环境部署脚本
-        if ask_yes_no "是否使用生产环境配置?" "n"; then
-            if [ -f "deploy_production_flow.sh" ]; then
-                bash deploy_production_flow.sh
-            fi
-        else
-            # 标准流量管理设置
-            if [ -f "setup_flow_management.sh" ]; then
-                bash setup_flow_management.sh
-            fi
-        fi
-    else
-        log_info "跳过流量限制系统部署"
-    fi
-else
-    log_info "跳过流量限制系统（流量管理未启用）"
-fi
-
-# ==========================================
-# 步骤 9: 配置滥用防护
-# ==========================================
-log_step "步骤 9/11: 滥用防护配置"
+log_step "步骤 4/5: 滥用防护配置"
 
 if ask_yes_no "是否配置滥用防护（防挖矿、BT、扫描）?" "y"; then
     log_info "配置滥用防护..."
@@ -378,27 +334,9 @@ else
 fi
 
 # ==========================================
-# 步骤 10: 配置 CPU 监控
+# 步骤 5: 创建并启用后端服务
 # ==========================================
-log_step "步骤 10/11: CPU 监控配置"
-
-if ask_yes_no "是否配置 CPU 使用率监控和自动重启?" "y"; then
-    log_info "配置 CPU 监控..."
-    
-    if [ -f "setup_cpu_autorestart_monitor.sh" ]; then
-        bash setup_cpu_autorestart_monitor.sh
-        log_ok "CPU 监控配置完成"
-    else
-        log_warn "未找到 setup_cpu_autorestart_monitor.sh"
-    fi
-else
-    log_info "跳过 CPU 监控配置"
-fi
-
-# ==========================================
-# 步骤 11: 创建并启用后端服务
-# ==========================================
-log_step "步骤 11/11: 后端 API 服务"
+log_step "步骤 5/5: 后端 API 服务"
 
 if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     log_info "配置后端服务..."
@@ -439,11 +377,29 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
         echo "MAIN_INTERFACE = $MAIN_INTERFACE" >> app.ini
     fi
     
+    # 更新 IPV6_INTERFACE
+    if [ -n "$IPV6_INTERFACE" ]; then
+        if grep -q "^IPV6_INTERFACE\s*=" app.ini; then
+            sed -i "s|^IPV6_INTERFACE\s*=.*|IPV6_INTERFACE = $IPV6_INTERFACE|g" app.ini
+        else
+            echo "IPV6_INTERFACE = $IPV6_INTERFACE" >> app.ini
+        fi
+    fi
+    
     # 更新 NAT_LISTEN_IP
     if grep -q "^NAT_LISTEN_IP\s*=" app.ini; then
         sed -i "s|^NAT_LISTEN_IP\s*=.*|NAT_LISTEN_IP = $IPV4_ADDRESS|g" app.ini
     else
         echo "NAT_LISTEN_IP = $IPV4_ADDRESS" >> app.ini
+    fi
+    
+    # 更新 IPV4_MODE
+    if [ -n "$IPV4_MODE" ]; then
+        if grep -q "^IPV4_MODE\s*=" app.ini; then
+            sed -i "s|^IPV4_MODE\s*=.*|IPV4_MODE = $IPV4_MODE|g" app.ini
+        else
+            echo "IPV4_MODE = $IPV4_MODE" >> app.ini
+        fi
     fi
     
     # 更新 IPV6_MODE
@@ -475,7 +431,11 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     
     log_ok "✓ app.ini 网络配置已更新"
     log_info "  MAIN_INTERFACE = $MAIN_INTERFACE"
+    if [ "$IPV6_INTERFACE" != "$MAIN_INTERFACE" ]; then
+        log_info "  IPV6_INTERFACE = $IPV6_INTERFACE"
+    fi
     log_info "  NAT_LISTEN_IP = $IPV4_ADDRESS"
+    log_info "  IPV4_MODE = $IPV4_MODE"
     if [ -n "$IPV6_MODE" ]; then
         log_info "  IPV6_MODE = $IPV6_MODE"
         if [ -n "$IPV6_PREFIX" ]; then
@@ -487,9 +447,9 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     fi
     
     # 使用 setup_lxd_api_service.sh 创建服务
-    if [ -f "setup_lxd_api_service.sh" ]; then
+    if [ -f "tools/setup/setup_lxd_api_service.sh" ]; then
         log_info "创建 systemd 服务..."
-        bash setup_lxd_api_service.sh
+        bash tools/setup/setup_lxd_api_service.sh
         log_ok "后端服务已创建并启动"
     else
         # 手动创建服务
@@ -498,8 +458,8 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
         cat > /etc/systemd/system/lxd-api.service << EOF
 [Unit]
 Description=LXD API Service
-After=network.target lxd.service
-Wants=lxd.service
+After=network.target snap.lxd.daemon.service lxd.service
+Wants=snap.lxd.daemon.service lxd.service
 
 [Service]
 Type=simple
@@ -542,36 +502,56 @@ echo ""
 # 网络配置
 echo -e "${COLOR_CYAN}网络配置:${COLOR_NC}"
 echo "  主网卡接口: $MAIN_INTERFACE"
-echo "  IPv4: $IPV4_ADDRESS"
+if [ "$IPV6_INTERFACE" != "$MAIN_INTERFACE" ]; then
+    echo "  IPv6 网卡接口: $IPV6_INTERFACE"
+fi
+echo "  IPv4 地址: $IPV4_ADDRESS"
+echo "  IPv4 模式: $IPV4_MODE"
 echo "  IPv6 模式: $IPV6_MODE"
 if [ -n "$IPV6_PREFIX" ]; then
     echo "  IPv6 前缀: $IPV6_PREFIX"
 fi
+if [ "$IPV4_MODE" = "OFF" ]; then
+    echo "  ⚠️  IPv6-Only 模式已启用，容器不分配 IPv4 地址"
+fi
 echo ""
 
-# 流量管理
+# 流量管理系统 V2
 if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
-    echo -e "${COLOR_CYAN}流量管理:${COLOR_NC}"
+    echo -e "${COLOR_CYAN}流量监控系统 V2 (iptables):${COLOR_NC}"
     echo "  ✅ 已启用"
     
     # 检查服务状态
-    if systemctl is-active --quiet lxd-flow-continuity.service; then
-        echo "  ✅ 流量连续性守护进程: 运行中"
+    if systemctl is-active --quiet lxd-event-listener.service; then
+        echo "  ✅ 事件监听器: 运行中"
     else
-        echo "  ⚠️  流量连续性守护进程: 未运行"
+        echo "  ⚠️  事件监听器: 未运行"
     fi
     
-    if systemctl is-active --quiet lxd-flow-enforcer.service; then
-        echo "  ✅ 流量限制执行器: 运行中"
+    # 检查定时器
+    if systemctl is-active --quiet lxd-flow-collector.timer; then
+        echo "  ✅ 流量收集器: 已配置 (每分钟)"
     else
-        echo "  ⚠️  流量限制执行器: 未运行"
+        echo "  ⚠️  流量收集器: 未配置"
     fi
     
-    # 检查定时任务
-    if crontab -l 2>/dev/null | grep -q "flow_reset_scheduler.py reset"; then
-        echo "  ✅ 流量重置定时任务: 已配置"
+    if systemctl is-active --quiet lxd-flow-limit-enforcer.timer; then
+        echo "  ✅ 流量限制执行器: 已配置 (每5分钟)"
     else
-        echo "  ⚠️  流量重置定时任务: 未配置"
+        echo "  ⚠️  流量限制执行器: 未配置"
+    fi
+    
+    if systemctl is-active --quiet lxd-flow-reset-scheduler.timer; then
+        echo "  ✅ 流量重置调度器: 已配置 (每天1AM)"
+    else
+        echo "  ⚠️  流量重置调度器: 未配置"
+    fi
+    
+    # 检查数据库
+    if [ -f "$SCRIPT_DIR/flow_management_v2.db" ]; then
+        echo "  ✅ 数据库: flow_management_v2.db"
+    else
+        echo "  ⚠️  数据库文件缺失"
     fi
     
     echo ""
@@ -606,13 +586,15 @@ fi
 echo -e "${COLOR_CYAN}常用命令:${COLOR_NC}"
 echo "  查看容器列表:       lxc list"
 if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
-    echo "  查看流量使用:       python3 $SCRIPT_DIR/list_flow_usage.py"
-    echo "  重置容器流量:       python3 $SCRIPT_DIR/flow_reset_scheduler.py reset <容器名>"
+    echo "  查看流量使用:       python3 $SCRIPT_DIR/flow_manager_v2.py list"
+    echo "  查询容器流量:       python3 $SCRIPT_DIR/flow_manager_v2.py info <容器名>"
+    echo "  重置容器流量:       python3 $SCRIPT_DIR/flow_manager_v2.py reset <容器名>"
 fi
 echo "  查看服务状态:       systemctl status lxd-api.service"
 if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
-    echo "  查看流量守护进程:   systemctl status lxd-flow-continuity.service"
-    echo "  查看限制执行器:     systemctl status lxd-flow-enforcer.service"
+    echo "  查看事件监听器:     systemctl status lxd-event-listener.service"
+    echo "  查看定时器状态:     systemctl list-timers lxd-flow-*"
+    echo "  查看流量日志:       tail -f $SCRIPT_DIR/flow_collector.log"
 fi
 echo "  查看服务日志:       journalctl -u lxd-api.service -f"
 echo ""
@@ -621,18 +603,20 @@ echo ""
 echo -e "${COLOR_YELLOW}后续操作建议:${COLOR_NC}"
 echo "  1. 检查所有服务状态是否正常"
 echo "  2. 测试创建一个容器验证功能"
-echo "  3. 查看 API 文档配置前端面板"
 if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
-    echo "  4. 验证流量监控是否正常工作"
+    echo "  3. 验证流量监控是否正常工作: python3 $SCRIPT_DIR/flow_manager_v2.py list"
+    echo "  4. 查看 API 文档配置前端面板"
+else
+    echo "  3. 查看 API 文档配置前端面板"
 fi
 echo ""
 
 # 提示可以运行检查脚本
 echo -e "${COLOR_CYAN}自动检查部署状态:${COLOR_NC}"
-if [ -f "$SCRIPT_DIR/post_deployment_check.sh" ]; then
-    echo "  bash $SCRIPT_DIR/check_deployment.sh"
-    echo ""
-    echo "  或者直接运行: bash $SCRIPT_DIR/post_deployment_check.sh"
+if [ -f "$SCRIPT_DIR/tools/diagnostic/check_deployment.sh" ]; then
+    echo "  bash $SCRIPT_DIR/tools/diagnostic/check_deployment.sh"
+elif [ -f "$SCRIPT_DIR/tools/post_deployment_check.sh" ]; then
+    echo "  bash $SCRIPT_DIR/tools/post_deployment_check.sh"
 else
     echo "  检查脚本未找到"
 fi

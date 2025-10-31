@@ -158,10 +158,16 @@ class FlowManager:
         restart_detected = False
 
         # 条件1：当前值明显小于历史最大值（且历史最大值不为0）
-        if (last_max_received > 0 and current_bytes_received < last_max_received * 0.9) or \
-           (last_max_sent > 0 and current_bytes_sent < last_max_sent * 0.9):
+        # 重要：排除容器停止的情况（current_bytes 完全为 0）
+        if (current_bytes_received > 0 or current_bytes_sent > 0) and \
+           ((last_max_received > 0 and current_bytes_received < last_max_received * 0.9) or \
+            (last_max_sent > 0 and current_bytes_sent < last_max_sent * 0.9)):
             restart_detected = True
             logger.warning(f"检测到容器 {hostname} 重启：当前流量({current_bytes_received + current_bytes_sent}) < 历史最大值({last_max_received + last_max_sent})")
+        elif (current_bytes_received == 0 and current_bytes_sent == 0 and 
+              (last_max_received > 0 or last_max_sent > 0)):
+            # 容器已停止，不触发重启逻辑，避免错误累加流量
+            logger.debug(f"容器 {hostname} 已停止 (current_bytes = 0)，跳过重启检测")
 
         # 条件2：历史最大值为0但当前有流量记录，说明是第一次运行新逻辑
         elif (last_max_received == 0 and last_max_sent == 0 and
@@ -376,6 +382,8 @@ class FlowManager:
                     UPDATE container_flow_management
                     SET accumulated_bytes_received = 0,
                         accumulated_bytes_sent = 0,
+                        baseline_bytes_received = ?,
+                        baseline_bytes_sent = ?,
                         last_max_bytes_received = ?,
                         last_max_bytes_sent = ?,
                         last_reset_date = ?,
@@ -384,7 +392,9 @@ class FlowManager:
                         reset_count = reset_count + 1,
                         updated_at = ?
                     WHERE hostname = ?
-                """, (current_bytes_received, current_bytes_sent, reset_date, next_reset_date,
+                """, (current_bytes_received, current_bytes_sent, 
+                      current_bytes_received, current_bytes_sent, 
+                      reset_date, next_reset_date,
                       reset_date, datetime.now(), hostname))
 
                 # 记录重置历史

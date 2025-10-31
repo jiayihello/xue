@@ -2,4 +2,5 @@ Flask
 pylxd
 python-dateutil
 configparser
-python-dateutil
+psutil
+filelock
