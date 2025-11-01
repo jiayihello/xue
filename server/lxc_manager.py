@@ -936,26 +936,49 @@ class LXCManager:
             else:
                 user_for_password = app_config.default_container_user
                 try:
-                    logger.info(f"为容器 {hostname} 的用户 {user_for_password} 设置初始密码 (使用 bash -c 'echo ... | chpasswd')")
+                    # ✅ 检查是否使用预构建镜像
+                    use_prebuilt = app_config.prebuilt_image
                     escaped_new_password = shlex.quote(new_password)
-                    command_to_execute_in_bash = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
-                    logger.debug(f"在容器内执行命令: bash -c \"{command_to_execute_in_bash}\"")
-
+                    
                     current_status_check = container.state().status
                     if current_status_check.lower() != 'running':
                         logger.error(f"容器 {hostname} 未处于运行状态 (当前状态: {current_status_check})，无法设置初始密码。")
                     else:
-                        exit_code, stdout, stderr = container.execute(['bash', '-c', command_to_execute_in_bash])
-                        if exit_code == 0:
-                            logger.info(f"容器 {hostname} 初始密码使用 bash -c 'echo ... | chpasswd' 设置成功")
+                        if use_prebuilt:
+                            # ✅ 预构建镜像：SSH已预装，只需设置密码和启动服务
+                            logger.info(f"检测到预构建镜像配置，跳过SSH安装步骤（镜像已预装），直接设置密码并启动SSH")
+                            command_to_execute_in_bash = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
+                            exit_code, stdout, stderr = container.execute(['bash', '-c', command_to_execute_in_bash])
+                            
+                            if exit_code == 0:
+                                logger.info(f"容器 {hostname} 初始密码设置成功")
+                            else:
+                                err_msg_stdout = stdout.decode('utf-8', errors='ignore').strip() if stdout else ""
+                                err_msg_stderr = stderr.decode('utf-8', errors='ignore').strip() if stderr else ""
+                                combined_err_msg = "; ".join(filter(None, [err_msg_stdout, err_msg_stderr]))
+                                logger.warning(f"容器 {hostname} 初始密码设置可能失败 (exit_code: {exit_code}): {combined_err_msg}")
+                            
+                            # 启动SSH服务
+                            logger.info(f"启动容器 {hostname} 的SSH服务")
+                            container.execute(['bash', '-c', 'systemctl start ssh || systemctl start sshd'])
+                            logger.info(f"容器 {hostname} SSH配置完成（预构建镜像快速模式）")
                         else:
-                            err_msg_stdout = stdout.decode('utf-8', errors='ignore').strip() if stdout else ""
-                            err_msg_stderr = stderr.decode('utf-8', errors='ignore').strip() if stderr else ""
-                            full_err_msg = []
-                            if err_msg_stdout: full_err_msg.append(f"STDOUT: {err_msg_stdout}")
-                            if err_msg_stderr: full_err_msg.append(f"STDERR: {err_msg_stderr}")
-                            combined_err_msg = "; ".join(full_err_msg) if full_err_msg else "命令执行失败，但未提供具体错误信息"
-                            logger.error(f"容器 {hostname} 设置初始密码失败 (exit_code: {exit_code}): {combined_err_msg}")
+                            # ❌ 官方镜像：执行完整的SSH安装流程（当前仅设置密码，后续可扩展）
+                            logger.info(f"为容器 {hostname} 的用户 {user_for_password} 设置初始密码 (使用 bash -c 'echo ... | chpasswd')")
+                            command_to_execute_in_bash = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
+                            logger.debug(f"在容器内执行命令: bash -c \"{command_to_execute_in_bash}\"")
+                            
+                            exit_code, stdout, stderr = container.execute(['bash', '-c', command_to_execute_in_bash])
+                            if exit_code == 0:
+                                logger.info(f"容器 {hostname} 初始密码使用 bash -c 'echo ... | chpasswd' 设置成功")
+                            else:
+                                err_msg_stdout = stdout.decode('utf-8', errors='ignore').strip() if stdout else ""
+                                err_msg_stderr = stderr.decode('utf-8', errors='ignore').strip() if stderr else ""
+                                full_err_msg = []
+                                if err_msg_stdout: full_err_msg.append(f"STDOUT: {err_msg_stdout}")
+                                if err_msg_stderr: full_err_msg.append(f"STDERR: {err_msg_stderr}")
+                                combined_err_msg = "; ".join(full_err_msg) if full_err_msg else "命令执行失败，但未提供具体错误信息"
+                                logger.error(f"容器 {hostname} 设置初始密码失败 (exit_code: {exit_code}): {combined_err_msg}")
                 except LXDAPIException as e_passwd:
                     logger.error(f"为容器 {hostname} 设置初始密码时发生LXD API错误: {e_passwd}")
                 except Exception as e_passwd_generic:
@@ -969,15 +992,24 @@ class LXCManager:
                 # IPv6-Only 模式：配置 IPv6 DNS
                 try:
                     logger.info(f"为容器 {hostname} 配置 IPv6 DNS...")
+                    
+                    # ✅ 使用兼容 systemd-resolved 的 DNS 配置方法（适用于 Debian/Ubuntu）
+                    # 删除符号链接，创建真实文件，并设置不可变属性
                     dns_config_cmd = [
                         'bash', '-c',
-                        'echo -e "nameserver 2a01:4f8:c2c:123f::1\\nnameserver 2a00:1098:2c::1\\nnameserver 2a01:4f9:c010:3f02::1" > /etc/resolv.conf'
+                        # 1. 删除 resolv.conf（如果是符号链接）
+                        'rm -f /etc/resolv.conf && '
+                        # 2. 创建真实文件并写入 DNS
+                        'echo -e "nameserver 2a01:4f8:c2c:123f::1\\nnameserver 2a00:1098:2c::1\\nnameserver 2a01:4f9:c010:3f02::1" > /etc/resolv.conf && '
+                        # 3. 设置不可变属性（如果系统支持 chattr）
+                        'chattr +i /etc/resolv.conf 2>/dev/null || true'
                     ]
                     result = container.execute(dns_config_cmd)
                     if result.exit_code == 0:
-                        logger.info(f"✓ 容器 {hostname} DNS 配置成功")
+                        logger.info(f"✓ 容器 {hostname} DNS 配置成功（使用 systemd-resolved 兼容方法）")
                     else:
-                        logger.warning(f"容器 {hostname} DNS 配置失败: {result.stderr}")
+                        stderr_msg = result.stderr if isinstance(result.stderr, str) else (result.stderr.decode('utf-8', errors='ignore') if result.stderr else '')
+                        logger.warning(f"容器 {hostname} DNS 配置失败: {stderr_msg}")
                 except Exception as e_dns:
                     logger.warning(f"为容器 {hostname} 配置 DNS 失败: {e_dns}")
             
@@ -2196,16 +2228,86 @@ class LXCManager:
                     except Exception as e:
                         logger.error(f"为重装后的容器 {hostname} 配置IPv6时出错: {e}")
 
+                    # ✅ IPv6-Only 模式：配置 DNS（重装后也需要）
+                    if app_config.ipv4_mode == 'OFF' and app_config.ipv6_mode == 'ROUTED':
+                        try:
+                            logger.info(f"为重装后的容器 {hostname} 配置 IPv6 DNS...")
+                            
+                            # Debian/Ubuntu 需要特殊处理（systemd-resolved）
+                            if not is_alpine:
+                                logger.info(f"检测到 Debian/Ubuntu 系统，使用 systemd-resolved 兼容的 DNS 配置方法")
+                                dns_config_cmd = [
+                                    'bash', '-c',
+                                    # 1. 删除 resolv.conf 符号链接
+                                    'rm -f /etc/resolv.conf && '
+                                    # 2. 创建真实文件并写入 DNS
+                                    'echo -e "nameserver 2a01:4f8:c2c:123f::1\\nnameserver 2a00:1098:2c::1\\nnameserver 2a01:4f9:c010:3f02::1" > /etc/resolv.conf && '
+                                    # 3. 设置不可变属性，防止被 systemd-resolved 覆盖
+                                    'chattr +i /etc/resolv.conf 2>/dev/null || true'
+                                ]
+                            else:
+                                # Alpine 使用原来的简单方法
+                                dns_config_cmd = [
+                                    'bash', '-c',
+                                    'echo -e "nameserver 2a01:4f8:c2c:123f::1\\nnameserver 2a00:1098:2c::1\\nnameserver 2a01:4f9:c010:3f02::1" > /etc/resolv.conf'
+                                ]
+                            
+                            result = new_container.execute(dns_config_cmd)
+                            if result.exit_code == 0:
+                                logger.info(f"✓ 重装后的容器 {hostname} DNS 配置成功")
+                            else:
+                                stderr_msg = result.stderr.decode('utf-8', errors='ignore') if isinstance(result.stderr, bytes) else str(result.stderr)
+                                logger.warning(f"重装后的容器 {hostname} DNS 配置失败: {stderr_msg}")
+                        except Exception as e_dns:
+                            logger.warning(f"为重装后的容器 {hostname} 配置 DNS 失败: {e_dns}")
+
                     escaped_new_password = shlex.quote(new_password)
 
                     try:
                         if is_alpine:
                             # Alpine特殊处理
                             logger.info(f"为Alpine容器 {hostname} 的用户 {user_for_password} 设置密码")
+                            
+                            # ✅ 检查是否使用预构建镜像
+                            use_prebuilt = app_config.prebuilt_image
+                            
                             try:
-                                # 先安装必要的包（带超时与镜像自动选择）
-                                logger.info(f"为Alpine容器 {hostname} 安装必要的软件包（带超时与镜像自动选择）")
-                                alpine_setup_script = r'''
+                                if use_prebuilt:
+                                    # ✅ 预构建镜像：SSH已预装，只需设置密码和启动服务
+                                    logger.info(f"检测到预构建镜像配置，跳过SSH安装步骤（镜像已预装）")
+                                    
+                                    # 设置密码
+                                    command_to_execute = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
+                                    exit_code, stdout, stderr = new_container.execute(['/bin/sh', '-c', command_to_execute])
+                                    
+                                    if exit_code == 0:
+                                        logger.info(f"Alpine容器 {hostname} 密码设置成功")
+                                    else:
+                                        err_msg = stderr.decode('utf-8', errors='ignore') if isinstance(stderr, bytes) else str(stderr)
+                                        logger.warning(f"Alpine容器 {hostname} 密码设置可能失败: {err_msg}")
+                                    
+                                    # 直接启动SSH服务（预构建镜像已配置好）
+                                    logger.info(f"启动Alpine容器 {hostname} 的SSH服务")
+                                    new_container.execute(['/bin/sh', '-c', '/usr/sbin/sshd'])
+                                    
+                                    # 快速验证SSH服务
+                                    verify_cmd, verify_stdout, verify_stderr = new_container.execute(['/bin/sh', '-c', 'pgrep sshd'])
+                                    if verify_stdout:
+                                        # ✅ 处理 stdout 可能是 str 或 bytes
+                                        pid_info = verify_stdout.decode('utf-8', errors='ignore').strip() if isinstance(verify_stdout, bytes) else str(verify_stdout).strip()
+                                        logger.info(f"SSH服务已成功启动 (PID: {pid_info})")
+                                    else:
+                                        logger.warning(f"SSH服务可能未启动，但继续流程")
+                                    
+                                    logger.info(f"Alpine容器 {hostname} SSH配置完成（预构建镜像快速模式）")
+                                    
+                                else:
+                                    # ❌ 官方镜像：执行完整的SSH安装流程
+                                    logger.info(f"使用官方镜像，执行完整的SSH安装流程")
+                                    
+                                    # 先安装必要的包（带超时与镜像自动选择）
+                                    logger.info(f"为Alpine容器 {hostname} 安装必要的软件包（带超时与镜像自动选择）")
+                                    alpine_setup_script = r'''
 set -e
 ver=$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || echo "3.19")
 # 优先尝试一组镜像（HTTP，BusyBox环境更友好），找到第一个可达的
@@ -2221,84 +2323,109 @@ fi
 (timeout 120 sh -c "apk update") || (echo "apk update 超时，重试一次" && timeout 120 sh -c "apk update")
 (timeout 180 sh -c "apk add --no-cache openssh shadow openrc curl busybox-extras") || (echo "apk add 超时，重试一次" && timeout 180 sh -c "apk add --no-cache openssh shadow openrc curl busybox-extras")
 '''
-                                exit_code_setup, out_setup, err_setup = new_container.execute(['/bin/sh', '-lc', alpine_setup_script])
-                                if exit_code_setup != 0:
-                                    out_msg = out_setup.decode('utf-8', errors='ignore') if isinstance(out_setup, (bytes, bytearray)) else str(out_setup)
-                                    err_msg = err_setup.decode('utf-8', errors='ignore') if isinstance(err_setup, (bytes, bytearray)) else str(err_setup)
-                                    logger.warning(f"Alpine 依赖安装脚本返回非零({exit_code_setup})，STDOUT: {out_msg}, STDERR: {err_msg}")
+                                    exit_code_setup, out_setup, err_setup = new_container.execute(['/bin/sh', '-lc', alpine_setup_script])
+                                    if exit_code_setup != 0:
+                                        out_msg = out_setup.decode('utf-8', errors='ignore') if isinstance(out_setup, (bytes, bytearray)) else str(out_setup)
+                                        err_msg = err_setup.decode('utf-8', errors='ignore') if isinstance(err_setup, (bytes, bytearray)) else str(err_setup)
+                                        logger.warning(f"Alpine 依赖安装脚本返回非零({exit_code_setup})，STDOUT: {out_msg}, STDERR: {err_msg}")
 
-                                # 使用完整的SSH配置流程
-                                logger.info(f"为Alpine容器 {hostname} 配置并启动SSH服务 (完整流程)")
+                                    # 使用完整的SSH配置流程
+                                    logger.info(f"为Alpine容器 {hostname} 配置并启动SSH服务 (完整流程)")
 
-                                # 创建必要的目录
-                                new_container.execute(['/bin/sh', '-c', 'mkdir -p /var/run/sshd'])
+                                    # 创建必要的目录
+                                    new_container.execute(['/bin/sh', '-c', 'mkdir -p /var/run/sshd'])
 
-                                # 修改SSH配置允许root登录和密码认证
-                                new_container.execute(['/bin/sh', '-c', 'sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config'])
-                                new_container.execute(['/bin/sh', '-c', 'sed -i "s/#PasswordAuthentication.*/PasswordAuthentication yes/g" /etc/ssh/sshd_config'])
-                                new_container.execute(['/bin/sh', '-c', 'sed -i "s/PasswordAuthentication.*/PasswordAuthentication yes/g" /etc/ssh/sshd_config'])
+                                    # 修改SSH配置允许root登录和密码认证
+                                    new_container.execute(['/bin/sh', '-c', 'sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/g" /etc/ssh/sshd_config'])
+                                    new_container.execute(['/bin/sh', '-c', 'sed -i "s/#PasswordAuthentication.*/PasswordAuthentication yes/g" /etc/ssh/sshd_config'])
+                                    new_container.execute(['/bin/sh', '-c', 'sed -i "s/PasswordAuthentication.*/PasswordAuthentication yes/g" /etc/ssh/sshd_config'])
 
-                                # 生成SSH密钥（如果不存在）
-                                new_container.execute(['/bin/sh', '-c', 'if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then ssh-keygen -A; fi'])
+                                    # 生成SSH密钥（如果不存在）
+                                    new_container.execute(['/bin/sh', '-c', 'if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then ssh-keygen -A; fi'])
 
-                                # 设置密码
-                                command_to_execute = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
-                                exit_code, stdout, stderr = new_container.execute(['/bin/sh', '-c', command_to_execute])
+                                    # 设置密码
+                                    command_to_execute = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
+                                    exit_code, stdout, stderr = new_container.execute(['/bin/sh', '-c', command_to_execute])
 
-                                # 添加到启动服务
-                                new_container.execute(['/bin/sh', '-c', 'rc-update add sshd default'])
+                                    # 添加到启动服务
+                                    new_container.execute(['/bin/sh', '-c', 'rc-update add sshd default'])
 
-                                # 直接启动SSH服务
-                                logger.info(f"直接启动Alpine容器 {hostname} 的SSH服务")
-                                start_ssh_output = new_container.execute(['/bin/sh', '-c', '/usr/sbin/sshd'])
-                                logger.info(f"启动SSH服务结果: {start_ssh_output}")
+                                    # 直接启动SSH服务
+                                    logger.info(f"直接启动Alpine容器 {hostname} 的SSH服务")
+                                    start_ssh_output = new_container.execute(['/bin/sh', '-c', '/usr/sbin/sshd'])
+                                    logger.info(f"启动SSH服务结果: {start_ssh_output}")
 
-                                # 验证SSH服务是否已启动
-                                verify_cmd, verify_stdout, verify_stderr = new_container.execute(['/bin/sh', '-c', 'ps | grep sshd'])
-                                if verify_stdout:
-                                    logger.info(f"SSH进程验证: {verify_stdout.decode('utf-8', errors='ignore')}")
-                                else:
-                                    logger.warning(f"未检测到SSH进程! stderr: {verify_stderr.decode('utf-8', errors='ignore')}")
-                                    ssh_config_success = False
+                                    # 验证SSH服务是否已启动
+                                    verify_cmd, verify_stdout, verify_stderr = new_container.execute(['/bin/sh', '-c', 'ps | grep sshd'])
+                                    if verify_stdout:
+                                        logger.info(f"SSH进程验证: {verify_stdout.decode('utf-8', errors='ignore')}")
+                                    else:
+                                        logger.warning(f"未检测到SSH进程! stderr: {verify_stderr.decode('utf-8', errors='ignore')}")
+                                        ssh_config_success = False
 
-                                # 添加额外的自启动方式（多重保障）
-                                new_container.execute(['/bin/sh', '-c', 'mkdir -p /etc/local.d'])
-                                new_container.execute(['/bin/sh', '-c', 'echo "#!/bin/sh" > /etc/local.d/sshd.start'])
-                                new_container.execute(['/bin/sh', '-c', 'echo "/usr/sbin/sshd" >> /etc/local.d/sshd.start'])
-                                new_container.execute(['/bin/sh', '-c', 'chmod +x /etc/local.d/sshd.start'])
-                                new_container.execute(['/bin/sh', '-c', 'rc-update add local default'])
+                                    # 添加额外的自启动方式（多重保障）
+                                    new_container.execute(['/bin/sh', '-c', 'mkdir -p /etc/local.d'])
+                                    new_container.execute(['/bin/sh', '-c', 'echo "#!/bin/sh" > /etc/local.d/sshd.start'])
+                                    new_container.execute(['/bin/sh', '-c', 'echo "/usr/sbin/sshd" >> /etc/local.d/sshd.start'])
+                                    new_container.execute(['/bin/sh', '-c', 'chmod +x /etc/local.d/sshd.start'])
+                                    new_container.execute(['/bin/sh', '-c', 'rc-update add local default'])
 
-                                # 检查22端口是否已在监听
-                                port_check_cmd, port_stdout, port_stderr = new_container.execute(['/bin/sh', '-c', 'netstat -tulpn | grep :22'])
-                                if port_stdout:
-                                    logger.info(f"端口22监听状态: {port_stdout.decode('utf-8', errors='ignore')}")
-                                else:
-                                    logger.warning(f"端口22未在监听! stderr: {port_stderr.decode('utf-8', errors='ignore')}")
-                                    ssh_config_success = False
+                                    # 检查22端口是否已在监听
+                                    port_check_cmd, port_stdout, port_stderr = new_container.execute(['/bin/sh', '-c', 'netstat -tulpn | grep :22'])
+                                    if port_stdout:
+                                        logger.info(f"端口22监听状态: {port_stdout.decode('utf-8', errors='ignore')}")
+                                    else:
+                                        logger.warning(f"端口22未在监听! stderr: {port_stderr.decode('utf-8', errors='ignore')}")
+                                        ssh_config_success = False
 
-                                logger.info(f"Alpine容器 {hostname} SSH配置完成")
+                                    logger.info(f"Alpine容器 {hostname} SSH配置完成")
 
                             except Exception as e_alpine:
                                 logger.error(f"为Alpine容器 {hostname} 安装或配置SSH时出错: {e_alpine}")
                                 ssh_config_success = False
                                 logger.info(f"尽管SSH配置出现错误，但将继续重装流程以避免上层应用失败: {e_alpine}")
                         else:
-                            # 常规系统处理
-                            logger.info(f"为常规容器 {hostname} 的用户 {user_for_password} 设置密码 (使用 bash -c 'echo ... | chpasswd')")
-                            command_to_execute_in_bash = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
-                            exit_code, stdout, stderr = new_container.execute(['bash', '-c', command_to_execute_in_bash])
+                            # 常规系统处理（Debian/Ubuntu 等）
+                            # ✅ 检查是否使用预构建镜像
+                            use_prebuilt = app_config.prebuilt_image
 
-                        if exit_code == 0:
-                            logger.info(f"重装后的容器 {hostname} 密码设置成功")
-                        else:
-                            err_msg_stdout = stdout.decode('utf-8', errors='ignore').strip() if stdout else ""
-                            err_msg_stderr = stderr.decode('utf-8', errors='ignore').strip() if stderr else ""
-                            full_err_msg = []
-                            if err_msg_stdout: full_err_msg.append(f"STDOUT: {err_msg_stdout}")
-                            if err_msg_stderr: full_err_msg.append(f"STDERR: {err_msg_stderr}")
-                            combined_err_msg = "; ".join(full_err_msg) if full_err_msg else "命令执行失败，但未提供具体错误信息"
-                            logger.error(f"重装后的容器 {hostname} 设置密码失败 (exit_code: {exit_code}): {combined_err_msg}")
-                            ssh_config_success = False
+                            if use_prebuilt:
+                                # ✅ 预构建镜像：SSH已预装，只需设置密码和启动服务
+                                logger.info(f"检测到预构建镜像配置，跳过SSH安装步骤（镜像已预装），直接设置密码并启动SSH")
+                                command_to_execute_in_bash = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
+                                exit_code, stdout, stderr = new_container.execute(['bash', '-c', command_to_execute_in_bash])
+
+                                if exit_code == 0:
+                                    logger.info(f"重装后的容器 {hostname} 密码设置成功")
+                                else:
+                                    err_msg_stdout = stdout.decode('utf-8', errors='ignore').strip() if stdout else ""
+                                    err_msg_stderr = stderr.decode('utf-8', errors='ignore').strip() if stderr else ""
+                                    combined_err_msg = "; ".join(filter(None, [err_msg_stdout, err_msg_stderr]))
+                                    logger.warning(f"重装后的容器 {hostname} 密码设置可能失败 (exit_code: {exit_code}): {combined_err_msg}")
+
+                                # 启动SSH服务
+                                logger.info(f"启动重装后的容器 {hostname} 的SSH服务")
+                                new_container.execute(['bash', '-c', 'systemctl start ssh || systemctl start sshd'])
+                                logger.info(f"重装后的容器 {hostname} SSH配置完成（预构建镜像快速模式）")
+                                ssh_config_success = True
+                            else:
+                                # ❌ 官方镜像：执行完整的SSH安装流程
+                                logger.info(f"使用官方镜像，执行完整的SSH安装流程")
+                                logger.info(f"为常规容器 {hostname} 的用户 {user_for_password} 设置密码 (使用 bash -c 'echo ... | chpasswd')")
+                                command_to_execute_in_bash = f"echo '{user_for_password}:{escaped_new_password}' | chpasswd"
+                                exit_code, stdout, stderr = new_container.execute(['bash', '-c', command_to_execute_in_bash])
+
+                                if exit_code == 0:
+                                    logger.info(f"重装后的容器 {hostname} 密码设置成功")
+                                else:
+                                    err_msg_stdout = stdout.decode('utf-8', errors='ignore').strip() if stdout else ""
+                                    err_msg_stderr = stderr.decode('utf-8', errors='ignore').strip() if stderr else ""
+                                    full_err_msg = []
+                                    if err_msg_stdout: full_err_msg.append(f"STDOUT: {err_msg_stdout}")
+                                    if err_msg_stderr: full_err_msg.append(f"STDERR: {err_msg_stderr}")
+                                    combined_err_msg = "; ".join(full_err_msg) if full_err_msg else "命令执行失败，但未提供具体错误信息"
+                                    logger.error(f"重装后的容器 {hostname} 设置密码失败 (exit_code: {exit_code}): {combined_err_msg}")
+                                    ssh_config_success = False
                     except Exception as e_ssh:
                         logger.error(f"为容器 {hostname} 配置SSH时发生异常: {e_ssh}")
                         ssh_config_success = False
@@ -2311,81 +2438,88 @@ fi
 
             # NAT规则添加也不影响重装成功
             nat_config_success = True
-            try:
-                # 先等待IP地址分配
-                container_ip_for_nat_reinstall = None
-                nat_add_attempts_reinstall = 0
-                while not container_ip_for_nat_reinstall and nat_add_attempts_reinstall < 3:
-                    container_ip_for_nat_reinstall = self._get_container_ip(new_container)
-                    if container_ip_for_nat_reinstall: break
-                    logger.warning(f"为重装后的容器 {hostname} 获取IP失败 (尝试 {nat_add_attempts_reinstall+1}/3)，等待后重试...")
-                    time.sleep(5)
-                    nat_add_attempts_reinstall += 1
+            
+            # ✅ IPv6-Only 模式跳过 NAT 规则恢复（容器没有 IPv4）
+            if app_config.ipv4_mode == 'OFF':
+                logger.info(f"容器 {hostname} 为 IPv6-Only 模式，跳过 NAT 规则恢复")
+                nat_config_success = True  # IPv6-Only 不需要 NAT，标记为成功
+            else:
+                # IPv4 模式：恢复 NAT 规则
+                try:
+                    # 先等待IP地址分配
+                    container_ip_for_nat_reinstall = None
+                    nat_add_attempts_reinstall = 0
+                    while not container_ip_for_nat_reinstall and nat_add_attempts_reinstall < 3:
+                        container_ip_for_nat_reinstall = self._get_container_ip(new_container)
+                        if container_ip_for_nat_reinstall: break
+                        logger.warning(f"为重装后的容器 {hostname} 获取IP失败 (尝试 {nat_add_attempts_reinstall+1}/3)，等待后重试...")
+                        time.sleep(5)
+                        nat_add_attempts_reinstall += 1
 
-                if not container_ip_for_nat_reinstall:
-                    logger.error(f"为重装后的容器 {hostname} 恢复端口转发规则失败：多次尝试后仍无法获取容器IP地址。")
-                    nat_config_success = False
-                else:
-                    # 1. 确保SSH端口转发存在（优先级高）
-                    if original_ssh_port:
-                        ssh_port_to_use = original_ssh_port
-                        logger.info(f"使用原始SSH端口 {ssh_port_to_use} 为容器 {hostname} 添加NAT规则")
-                    else:
-                        ssh_external_port_min_reinstall = 10000
-                        ssh_external_port_max_reinstall = 65535
-                        ssh_port_to_use = random.randint(ssh_external_port_min_reinstall, ssh_external_port_max_reinstall)
-                        logger.info(f"没有找到原始SSH端口，使用随机端口 {ssh_port_to_use} 为容器 {hostname} 添加NAT规则")
-
-                    logger.info(f"尝试为重装后的容器 {hostname} 自动添加 SSH (端口 22) 的 NAT 规则，使用外部端口 {ssh_port_to_use}")
-                    add_ssh_rule_result_reinstall = self.add_nat_rule_via_iptables(new_container.name, 'tcp', str(ssh_port_to_use), '22')
-                    if add_ssh_rule_result_reinstall.get('code') == 200:
-                        logger.info(f"成功为重装后的容器 {hostname} 自动添加 SSH NAT 规则: 外部端口 {ssh_port_to_use} -> 内部端口 22")
-                    elif add_ssh_rule_result_reinstall.get('code') == 409:
-                        logger.warning(f"尝试为重装后的容器 {hostname} 自动添加 SSH NAT 规则失败：外部端口 {ssh_port_to_use} 已被此容器的其他规则使用。可尝试手动添加其他端口。")
-                    else:
-                        logger.error(f"为重装后的容器 {hostname} 自动添加 SSH NAT 规则失败。外部端口: {ssh_port_to_use}, 原因: {add_ssh_rule_result_reinstall.get('msg')}")
-
-                    # 2. 恢复先前保存的所有端口转发规则
-                    restored_count = 0
-                    failed_count = 0
-
-                    # 排除SSH规则以避免重复添加
-                    saved_non_ssh_nat_rules = []
-                    for rule in saved_nat_rules:
-                        # 跳过SSH规则，因为我们已经添加了
-                        if rule.get('Dtype', '').lower() == 'tcp' and str(rule.get('Sport')) == '22':
-                            continue
-                        saved_non_ssh_nat_rules.append(rule)
-
-                    logger.info(f"开始为容器 {hostname} 恢复 {len(saved_non_ssh_nat_rules)} 条非SSH端口转发规则")
-
-                    for rule in saved_non_ssh_nat_rules:
-                        rule_type = rule.get('Dtype', '').lower()  # 注意这里的键名大写开头
-                        dport = rule.get('Dport')                  # 注意这里的键名大写开头
-                        sport = rule.get('Sport')                  # 注意这里的键名大写开头
-
-                        if not all([rule_type, dport, sport]):
-                            logger.warning(f"跳过无效的端口转发规则: {rule}")
-                            failed_count += 1
-                            continue
-
-                        logger.info(f"恢复端口转发规则: {rule_type} {dport} -> {sport}")
-                        result = self.add_nat_rule_via_iptables(hostname, rule_type, str(dport), str(sport))
-
-                        if result.get('code') == 200:
-                            logger.info(f"成功恢复端口转发规则: {rule_type} {dport} -> {sport}")
-                            restored_count += 1
-                        else:
-                            logger.warning(f"恢复端口转发规则失败: {rule_type} {dport} -> {sport}, 原因: {result.get('msg')}")
-                            failed_count += 1
-
-                    logger.info(f"容器 {hostname} 的端口转发规则恢复完成: 成功 {restored_count}, 失败 {failed_count}")
-
-                    if failed_count > 0:
+                    if not container_ip_for_nat_reinstall:
+                        logger.error(f"为重装后的容器 {hostname} 恢复端口转发规则失败：多次尝试后仍无法获取容器IP地址。")
                         nat_config_success = False
-            except Exception as e_nat_reinstall:
-                logger.error(f"为重装后的容器 {hostname} 恢复端口转发规则时发生异常: {str(e_nat_reinstall)}", exc_info=True)
-                nat_config_success = False
+                    else:
+                        # 1. 确保SSH端口转发存在（优先级高）
+                        if original_ssh_port:
+                            ssh_port_to_use = original_ssh_port
+                            logger.info(f"使用原始SSH端口 {ssh_port_to_use} 为容器 {hostname} 添加NAT规则")
+                        else:
+                            ssh_external_port_min_reinstall = 10000
+                            ssh_external_port_max_reinstall = 65535
+                            ssh_port_to_use = random.randint(ssh_external_port_min_reinstall, ssh_external_port_max_reinstall)
+                            logger.info(f"没有找到原始SSH端口，使用随机端口 {ssh_port_to_use} 为容器 {hostname} 添加NAT规则")
+
+                        logger.info(f"尝试为重装后的容器 {hostname} 自动添加 SSH (端口 22) 的 NAT 规则，使用外部端口 {ssh_port_to_use}")
+                        add_ssh_rule_result_reinstall = self.add_nat_rule_via_iptables(new_container.name, 'tcp', str(ssh_port_to_use), '22')
+                        if add_ssh_rule_result_reinstall.get('code') == 200:
+                            logger.info(f"成功为重装后的容器 {hostname} 自动添加 SSH NAT 规则: 外部端口 {ssh_port_to_use} -> 内部端口 22")
+                        elif add_ssh_rule_result_reinstall.get('code') == 409:
+                            logger.warning(f"尝试为重装后的容器 {hostname} 自动添加 SSH NAT 规则失败：外部端口 {ssh_port_to_use} 已被此容器的其他规则使用。可尝试手动添加其他端口。")
+                        else:
+                            logger.error(f"为重装后的容器 {hostname} 自动添加 SSH NAT 规则失败。外部端口: {ssh_port_to_use}, 原因: {add_ssh_rule_result_reinstall.get('msg')}")
+
+                        # 2. 恢复先前保存的所有端口转发规则
+                        restored_count = 0
+                        failed_count = 0
+
+                        # 排除SSH规则以避免重复添加
+                        saved_non_ssh_nat_rules = []
+                        for rule in saved_nat_rules:
+                            # 跳过SSH规则，因为我们已经添加了
+                            if rule.get('Dtype', '').lower() == 'tcp' and str(rule.get('Sport')) == '22':
+                                continue
+                            saved_non_ssh_nat_rules.append(rule)
+
+                        logger.info(f"开始为容器 {hostname} 恢复 {len(saved_non_ssh_nat_rules)} 条非SSH端口转发规则")
+
+                        for rule in saved_non_ssh_nat_rules:
+                            rule_type = rule.get('Dtype', '').lower()  # 注意这里的键名大写开头
+                            dport = rule.get('Dport')                  # 注意这里的键名大写开头
+                            sport = rule.get('Sport')                  # 注意这里的键名大写开头
+
+                            if not all([rule_type, dport, sport]):
+                                logger.warning(f"跳过无效的端口转发规则: {rule}")
+                                failed_count += 1
+                                continue
+
+                            logger.info(f"恢复端口转发规则: {rule_type} {dport} -> {sport}")
+                            result = self.add_nat_rule_via_iptables(hostname, rule_type, str(dport), str(sport))
+
+                            if result.get('code') == 200:
+                                logger.info(f"成功恢复端口转发规则: {rule_type} {dport} -> {sport}")
+                                restored_count += 1
+                            else:
+                                logger.warning(f"恢复端口转发规则失败: {rule_type} {dport} -> {sport}, 原因: {result.get('msg')}")
+                                failed_count += 1
+
+                        logger.info(f"容器 {hostname} 的端口转发规则恢复完成: 成功 {restored_count}, 失败 {failed_count}")
+
+                        if failed_count > 0:
+                            nat_config_success = False
+                except Exception as e_nat_reinstall:
+                    logger.error(f"为重装后的容器 {hostname} 恢复端口转发规则时发生异常: {str(e_nat_reinstall)}", exc_info=True)
+                    nat_config_success = False
 
             # 重装成功但SSH或NAT可能有问题
             if not ssh_config_success:

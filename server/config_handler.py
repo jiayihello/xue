@@ -50,4 +50,7 @@ class AppConfig:
         if not self.main_interface:
             raise ValueError("配置文件 [lxc] 中必须设置 MAIN_INTERFACE (主网卡名)，用于iptables MASQUERADE规则")
 
+        # 镜像相关配置（可选）
+        self.prebuilt_image = parser.getboolean('image', 'PREBUILT_IMAGE', fallback=False)
+
 app_config = AppConfig()
