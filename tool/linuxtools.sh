@@ -1622,14 +1622,28 @@ setup_time_sync() {
     # 配置定时任务（每天凌晨2点同步）
     msg_info "配置定时任务（每天凌晨2点自动同步）..."
     
+    # 临时禁用 errexit，避免 crontab 命令失败导致脚本退出
+    set +o errexit
+    
+    # 获取当前的 crontab（如果不存在则为空）
+    local current_cron
+    current_cron=$(crontab -l 2>/dev/null || true)
+    
     # 检查 cron 任务是否已存在
-    if crontab -l 2>/dev/null | grep -q "ntpdate.*time.cloudflare.com"; then
+    if echo "$current_cron" | grep -q "ntpdate.*time.cloudflare.com"; then
         msg_info "定时任务已存在，跳过..."
     else
         # 添加新的 cron 任务
-        (crontab -l 2>/dev/null; echo "0 2 * * * /usr/sbin/ntpdate time.cloudflare.com >/dev/null 2>&1") | crontab -
-        msg_ok "✓ 定时任务已添加"
+        (echo "$current_cron"; echo "0 2 * * * /usr/sbin/ntpdate time.cloudflare.com >/dev/null 2>&1") | crontab - 2>/dev/null
+        if [ $? -eq 0 ]; then
+            msg_ok "✓ 定时任务已添加"
+        else
+            msg_warn "⚠ 定时任务添加失败，可手动添加: crontab -e"
+        fi
     fi
+    
+    # 重新启用 errexit
+    set -o errexit
     
     echo ""
     msg_ok "✓ 时间同步配置完成"
