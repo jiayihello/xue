@@ -1590,6 +1590,53 @@ remove_swap_file() {
 # 服务器部署函数
 # ========================================
 
+setup_time_sync() {
+    msg_info "正在配置自动时间同步..."
+    echo ""
+    
+    # 安装 ntpdate
+    if ! command -v ntpdate &>/dev/null; then
+        msg_info "安装 ntpdate 工具..."
+        if apt-get install -y ntpdate 2>&1 | grep -v "^Selecting\|^Preparing\|^Unpacking\|^Setting up"; then
+            msg_ok "✓ ntpdate 已安装"
+        else
+            msg_warn "⚠ ntpdate 安装可能失败，继续..."
+        fi
+    else
+        msg_ok "✓ ntpdate 已存在"
+    fi
+    
+    # 立即同步一次时间
+    msg_info "正在同步时间..."
+    if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        systemctl stop systemd-timesyncd 2>/dev/null || true
+    fi
+    
+    if ntpdate -u time.cloudflare.com 2>&1 | grep -q "offset"; then
+        msg_ok "✓ 时间同步成功"
+    else
+        ntpdate -u ntp.aliyun.com 2>/dev/null || ntpdate -u cn.ntp.org.cn 2>/dev/null || true
+        msg_ok "✓ 时间已更新"
+    fi
+    
+    # 配置定时任务（每天凌晨2点同步）
+    msg_info "配置定时任务（每天凌晨2点自动同步）..."
+    
+    # 检查 cron 任务是否已存在
+    if crontab -l 2>/dev/null | grep -q "ntpdate.*time.cloudflare.com"; then
+        msg_info "定时任务已存在，跳过..."
+    else
+        # 添加新的 cron 任务
+        (crontab -l 2>/dev/null; echo "0 2 * * * /usr/sbin/ntpdate time.cloudflare.com >/dev/null 2>&1") | crontab -
+        msg_ok "✓ 定时任务已添加"
+    fi
+    
+    echo ""
+    msg_ok "✓ 时间同步配置完成"
+    msg_info "当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo ""
+}
+
 deploy_lxd_server() {
     clear_screen
     msg_info "--- LXD 服务器后端一键部署 ---"
@@ -1631,11 +1678,12 @@ deploy_lxd_server() {
     echo -e "${COLOR_CYAN}========================================${COLOR_NC}"
     echo ""
     msg_info "此脚本将自动完成以下步骤:"
-    echo "  1. 安装 Python 依赖"
-    echo "  2. 配置网络 (IPv4 + IPv6)"
-    echo "  3. 部署流量管理系统"
-    echo "  4. 配置滥用防护"
-    echo "  5. 启动后端 API 服务"
+    echo "  1. 配置自动时间同步（每天凌晨2点）"
+    echo "  2. 安装 Python 依赖"
+    echo "  3. 配置网络 (IPv4 + IPv6)"
+    echo "  4. 部署流量管理系统"
+    echo "  5. 配置滥用防护"
+    echo "  6. 启动后端 API 服务"
     echo ""
     msg_warn "预计时间: 5-10 分钟"
     echo ""
@@ -1650,6 +1698,9 @@ deploy_lxd_server() {
     echo ""
     msg_info "开始部署..."
     echo ""
+    
+    # 配置时间同步（在部署之前）
+    setup_time_sync
     
     # 添加执行权限
     chmod +x "$deploy_script"
@@ -1707,6 +1758,9 @@ deploy_lxd_server() {
         echo "  查看服务状态: systemctl status lxd-api.service"
         echo "  查看流量使用: python3 $server_dir/list_flow_usage.py"
         echo "  查看服务日志: journalctl -u lxd-api.service -f"
+        echo "  查看时间同步: date"
+        echo "  查看定时任务: crontab -l"
+        echo "  手动同步时间: ntpdate time.cloudflare.com"
         echo ""
     else
         echo ""
