@@ -1871,12 +1871,12 @@ update_lxd_server() {
     msg_ok "✓ 配置和数据已备份到: $backup_dir"
     echo ""
     
-    # 下载最新代码
+    # 下载最新代码（从 old 分支）
     msg_info "[3/8] 从 GitHub 下载最新代码..."
     local temp_dir="/tmp/lxd-server-update-$$"
     mkdir -p "$temp_dir"
     
-    if ! git clone --depth 1 https://github.com/jiayihello/xue.git "$temp_dir" 2>&1 | grep -v "warning:"; then
+    if ! git clone --depth 1 -b old https://github.com/jiayihello/xue.git "$temp_dir" 2>&1 | grep -v "warning:"; then
         msg_error "下载失败，请检查网络连接"
         rm -rf "$temp_dir"
         systemctl start lxd-api.service
@@ -1889,6 +1889,8 @@ update_lxd_server() {
     local new_server_dir="$temp_dir/server"
     if [[ ! -d "$new_server_dir" ]]; then
         msg_error "下载的代码中未找到 server 目录"
+        msg_info "正在列出下载的内容..."
+        ls -la "$temp_dir" 2>/dev/null || true
         rm -rf "$temp_dir"
         systemctl start lxd-api.service
         return 1
@@ -2137,12 +2139,12 @@ update_linuxtools() {
     # 获取当前工具箱目录
     local current_dir="$HOME/lxd-toolkit"
     
-    # 下载最新版本
+    # 下载最新版本（从 old 分支）
     msg_info "[1/3] 从 GitHub 下载最新版本..."
     local temp_dir="/tmp/linuxtools-update-$$"
     mkdir -p "$temp_dir"
     
-    if ! git clone --depth 1 https://github.com/jiayihello/xue.git "$temp_dir" 2>&1 | grep -v "warning:"; then
+    if ! git clone --depth 1 -b old https://github.com/jiayihello/xue.git "$temp_dir" 2>&1 | grep -v "warning:"; then
         msg_error "下载失败，请检查网络连接"
         rm -rf "$temp_dir"
         return 1
@@ -2150,10 +2152,30 @@ update_linuxtools() {
     msg_ok "✓ 最新版本下载完成"
     echo ""
     
-    # 检查下载的 tool 目录
-    local new_tools_dir="$temp_dir/tool"
-    if [[ ! -d "$new_tools_dir" ]]; then
-        msg_error "下载的代码中未找到 tool 目录"
+    # 检查下载的工具箱目录（支持多种可能的目录结构）
+    local new_tools_dir=""
+    if [[ -d "$temp_dir/tool" ]]; then
+        new_tools_dir="$temp_dir/tool"
+        msg_info "检测到目录: tool"
+    elif [[ -d "$temp_dir/LinuxTools-main" ]]; then
+        new_tools_dir="$temp_dir/LinuxTools-main"
+        msg_info "检测到目录: LinuxTools-main"
+    else
+        msg_error "下载的代码中未找到工具箱目录"
+        msg_error "预期目录: tool 或 LinuxTools-main"
+        echo ""
+        msg_info "正在列出下载的内容..."
+        ls -la "$temp_dir" 2>/dev/null || true
+        echo ""
+        msg_info "正在列出子目录..."
+        find "$temp_dir" -maxdepth 2 -name "*.sh" 2>/dev/null || true
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    # 检查 linuxtools.sh 是否存在
+    if [[ ! -f "$new_tools_dir/linuxtools.sh" ]]; then
+        msg_error "在 $new_tools_dir 中未找到 linuxtools.sh"
         rm -rf "$temp_dir"
         return 1
     fi
@@ -2164,7 +2186,7 @@ update_linuxtools() {
     # 确保目标目录存在
     mkdir -p "$current_dir/tool"
     
-    # 只复制 tool 目录，不会影响 server 目录
+    # 只复制工具箱目录的文件，不会影响 server 目录
     cp -f "$new_tools_dir"/* "$current_dir/tool/" 2>/dev/null || true
     chmod +x "$current_dir/tool/linuxtools.sh"
     
