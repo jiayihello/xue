@@ -14,8 +14,8 @@ import sqlite3
 import random
 from datetime import datetime
 
-# 添加当前目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 添加父目录(server/)到Python路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lxc_manager import LXCManager
 from flow_manager import FlowManager

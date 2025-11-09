@@ -7,8 +7,8 @@ IPv6 地址管理工具
 import sys
 import os
 
-# 确保可以导入本地模块
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 添加父目录(server/)到Python路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ipv6_manager import allocate, get_allocated, list_allocations, release
 from lxc_manager import LXCManager

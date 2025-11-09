@@ -11,8 +11,8 @@ import os
 import sqlite3
 from datetime import datetime
 
-# 添加当前目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 添加父目录(server/)到Python路径
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from flow_manager import FlowManager
 from lxc_manager import LXCManager

@@ -24,8 +24,8 @@ import sys
 import time
 from datetime import datetime
 
-# Allow import from this project folder
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add parent directory (server/) to Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from pylxd import Client
