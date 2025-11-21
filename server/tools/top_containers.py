@@ -23,6 +23,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from typing import Optional, List, Tuple
 
 # Add parent directory (server/) to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,7 +35,7 @@ except Exception as e:
     raise
 
 
-def sample_stats(client: 'Client', names: list[str], interval: float = 1.0):
+def sample_stats(client: 'Client', names: List[str], interval: float = 1.0):
     """Return a dict: name -> (cpu_percent, mem_mb, rx_kbps, tx_kbps)."""
     before_cpu = {}
     before_net = {}
@@ -87,7 +88,7 @@ def sample_stats(client: 'Client', names: list[str], interval: float = 1.0):
     return results
 
 
-def fetch_running_names(client: 'Client', name_filter: str | None = None):
+def fetch_running_names(client: 'Client', name_filter: Optional[str] = None):
     names = []
     for ct in client.containers.all():
         try:
@@ -100,7 +101,7 @@ def fetch_running_names(client: 'Client', name_filter: str | None = None):
     return names
 
 
-def print_table(rows: list[tuple[str, float, int, float, float]], top_n: int, header: bool = True):
+def print_table(rows: List[Tuple[str, float, int, float, float]], top_n: int, header: bool = True):
     rows_sorted = sorted(rows, key=lambda x: x[1], reverse=True)[:top_n]
     if header:
         print(f"\nTime: {datetime.now().strftime('%H:%M:%S')} | Showing top {top_n} by CPU%")
@@ -117,10 +118,12 @@ def main():
     ap.add_argument('-f', '--filter', type=str, default=None, help='name substring filter')
     # Auto-restart options
     ap.add_argument('--auto-restart', action='store_true', help='当CPU持续高占用时自动重启容器')
-    ap.add_argument('--cpu-threshold', type=float, default=30.0, help='CPU阈值百分比(0-100)，高于该值视为高占用，默认90')
+    ap.add_argument('--cpu-threshold', type=float, default=85.0, help='CPU阈值百分比(0-100)，高于该值视为高占用，默认85')
     ap.add_argument('--cpu-duration', type=float, default=180.0, help='CPU持续高于阈值的秒数，达到后触发重启，默认180秒')
     ap.add_argument('--cooldown', type=float, default=300.0, help='同一容器重启后的冷却期(秒)，默认300')
-    ap.add_argument('--max-restarts', type=int, default=3, help='每个容器在监控期间允许的最大自动重启次数，默认3')
+    ap.add_argument('--max-restarts', type=int, default=3, help='每个容器在监控期间允许的最大自动重启次数，达到后自动关机，默认3')
+    ap.add_argument('--auto-stop', action='store_true', default=True, help='达到最大重启次数后自动关机容器，默认启用')
+    ap.add_argument('--no-auto-stop', dest='auto_stop', action='store_false', help='禁用自动关机，仅停止重启')
     args = ap.parse_args()
 
     client = Client()
@@ -139,10 +142,12 @@ def main():
             high_cpu_since: dict[str, float] = {}
             last_restart_at: dict[str, float] = {}
             restart_counts: dict[str, int] = {}
+            stopped_containers: set[str] = set()  # 跟踪已自动关机的容器
 
             if args.auto_restart:
+                auto_stop_msg = "达到后自动关机" if args.auto_stop else "达到后停止重启"
                 print(
-                    f"启用自动重启策略: CPU>{args.cpu_threshold}% 持续≥{args.cpu_duration}s -> 重启; 冷却期 {int(args.cooldown)}s; 每容器最多 {args.max_restarts} 次\n"
+                    f"启用自动重启策略: CPU>{args.cpu_threshold}% 持续≥{args.cpu_duration}s -> 重启; 冷却期 {int(args.cooldown)}s; 每容器最多 {args.max_restarts} 次({auto_stop_msg})\n"
                 )
                 time.sleep(1)
 
@@ -168,8 +173,26 @@ def main():
                 if args.auto_restart:
                     now_ts = time.time()
                     for n, (cpu, _mem, _rx, _tx) in res.items():
-                        # skip if already reached max restarts
+                        # 如果容器已经手动启动（从stopped_containers中移除）
+                        if n in stopped_containers:
+                            stopped_containers.remove(n)
+                            print(f"ℹ️ 检测到容器 {n} 已手动启动，重新开始监控（重启计数已重置）")
+                        # 检查是否已达到最大重启次数
                         if restart_counts.get(n, 0) >= args.max_restarts:
+                            # 如果启用自动关机且容器还在运行
+                            if args.auto_stop and n not in stopped_containers and cpu >= args.cpu_threshold:
+                                try:
+                                    container = client.containers.get(n)
+                                    if container.status == 'Running':
+                                        print(f"🛑 容器 {n} 已重启{args.max_restarts}次仍高CPU({cpu}%)，执行自动关机...")
+                                        container.stop(wait=True)
+                                        stopped_containers.add(n)
+                                        print(f"✅ 容器 {n} 已自动关机。需要人工检查后手动启动。")
+                                        # 重置重启计数，下次手动启动后重新计数
+                                        restart_counts[n] = 0
+                                        high_cpu_since[n] = None
+                                except Exception as e:
+                                    print(f"❌ 自动关机容器 {n} 失败: {e}", file=sys.stderr)
                             continue
                         if cpu >= args.cpu_threshold:
                             start_ts = high_cpu_since.get(n)

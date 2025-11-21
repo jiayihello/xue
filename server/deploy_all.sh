@@ -84,7 +84,7 @@ check_root
 # ==========================================
 # 步骤 1: 安装 Python 依赖
 # ==========================================
-log_step "步骤 1/5: 安装 Python 依赖"
+log_step "步骤 1/6: 安装 Python 依赖"
 
 if [ -f "requirements.txt" ]; then
     log_info "安装 requirements.txt 中的依赖..."
@@ -100,7 +100,7 @@ fi
 # ==========================================
 # 步骤 2: 网络配置
 # ==========================================
-log_step "步骤 2/5: 网络配置"
+log_step "步骤 2/6: 网络配置"
 
 # 检测可用的网卡接口
 echo ""
@@ -285,7 +285,7 @@ fi
 # ==========================================
 # 步骤 3: 部署 iptables 流量监控系统 V2
 # ==========================================
-log_step "步骤 3/5: 部署 iptables 流量监控系统 V2"
+log_step "步骤 3/6: 部署 iptables 流量监控系统 V2"
 
 if ask_yes_no "是否部署流量监控系统（iptables V2）?" "y"; then
     log_info "开始部署流量监控系统..."
@@ -317,7 +317,7 @@ fi
 # ==========================================
 # 步骤 4: 配置滥用防护
 # ==========================================
-log_step "步骤 4/5: 滥用防护配置"
+log_step "步骤 4/6: 滥用防护配置"
 
 if ask_yes_no "是否配置滥用防护（防挖矿、BT、扫描）?" "y"; then
     log_info "配置滥用防护..."
@@ -334,9 +334,41 @@ else
 fi
 
 # ==========================================
-# 步骤 5: 创建并启用后端服务
+# 步骤 5: CPU保护系统
 # ==========================================
-log_step "步骤 5/5: 后端 API 服务"
+log_step "步骤 5/6: CPU保护系统"
+
+if ask_yes_no "是否部署CPU保护系统（自动杀进程+重启+关机）?" "n"; then
+    log_info "开始部署CPU保护系统..."
+    
+    # 检查部署脚本是否存在
+    if [ -f "tools/deploy_cpu_protection.sh" ]; then
+        # 执行CPU保护系统部署脚本（快速模式）
+        if bash tools/deploy_cpu_protection.sh --quick; then
+            log_ok "CPU保护系统部署完成"
+            ENABLE_CPU_PROTECTION=true
+        else
+            log_error "CPU保护系统部署失败"
+            if ask_yes_no "是否继续部署其他组件?" "y"; then
+                log_warn "跳过CPU保护系统，继续部署"
+                ENABLE_CPU_PROTECTION=false
+            else
+                exit 1
+            fi
+        fi
+    else
+        log_error "未找到 tools/deploy_cpu_protection.sh 脚本"
+        ENABLE_CPU_PROTECTION=false
+    fi
+else
+    log_info "跳过CPU保护系统部署"
+    ENABLE_CPU_PROTECTION=false
+fi
+
+# ==========================================
+# 步骤 6: 创建并启用后端服务
+# ==========================================
+log_step "步骤 6/6: 后端 API 服务"
 
 if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
     log_info "配置后端服务..."
@@ -582,6 +614,28 @@ if crontab -l 2>/dev/null | grep -q "abuse_guard.py apply"; then
     echo ""
 fi
 
+# CPU保护系统
+if [ "$ENABLE_CPU_PROTECTION" = true ]; then
+    echo -e "${COLOR_CYAN}CPU保护系统:${COLOR_NC}"
+    echo "  ✅ 已启用（激进模式）"
+    
+    # 检查服务状态
+    if systemctl is-active --quiet lxd-cpu-killer.service; then
+        echo "  ✅ 第一层（进程杀手）: 运行中 (CPU>60% → 杀进程)"
+    else
+        echo "  ⚠️  第一层（进程杀手）: 未运行"
+    fi
+    
+    if systemctl is-active --quiet lxd-auto-restart.service; then
+        echo "  ✅ 第二层（自动重启）: 运行中 (CPU>85% → 重启/关机)"
+    else
+        echo "  ⚠️  第二层（自动重启）: 未运行"
+    fi
+    
+    echo "  📊 监控日志: journalctl -u lxd-cpu-killer -u lxd-auto-restart -f"
+    echo ""
+fi
+
 # 常用命令
 echo -e "${COLOR_CYAN}常用命令:${COLOR_NC}"
 echo "  查看容器列表:       lxc list"
@@ -597,6 +651,10 @@ if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
     echo "  查看流量日志:       tail -f $SCRIPT_DIR/flow_collector.log"
 fi
 echo "  查看服务日志:       journalctl -u lxd-api.service -f"
+if [ "$ENABLE_CPU_PROTECTION" = true ]; then
+    echo "  CPU保护监控:        journalctl -u lxd-cpu-killer -u lxd-auto-restart -f"
+    echo "  CPU保护面板:        bash $SCRIPT_DIR/tools/monitor_protection.sh"
+fi
 echo ""
 
 # 后续操作建议
