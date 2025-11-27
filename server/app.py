@@ -1,18 +1,97 @@
 import os
-from flask import Flask, jsonify, request
+import re
+import time
+import threading
+from collections import defaultdict
 from functools import wraps
-import logging
 
+from flask import Flask, request, jsonify
+import logging
 from config_handler import app_config
+
+# hostname 验证正则：允许字母、数字、下划线、连字符，1-63字符，不能以连字符开头
+HOSTNAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$')
+
+def validate_hostname(hostname):
+    """
+    验证 hostname 格式是否合法
+    
+    Args:
+        hostname: 待验证的主机名
+        
+    Returns:
+        (bool, str): (是否合法, 错误信息)
+    """
+    if not hostname:
+        return False, 'hostname 不能为空'
+    if not isinstance(hostname, str):
+        return False, 'hostname 必须是字符串'
+    if len(hostname) > 63:
+        return False, 'hostname 长度不能超过63个字符'
+    if not HOSTNAME_PATTERN.match(hostname):
+        return False, 'hostname 格式无效，只允许字母、数字、下划线和连字符，且不能以连字符开头'
+    return True, ''
+
+# === 速率限制（防止暴力破解和滥用）===
+class RateLimiter:
+    """简单的内存速率限制器"""
+    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests = defaultdict(list)
+        self.lock = threading.Lock()
+    
+    def is_allowed(self, client_ip: str) -> bool:
+        """检查请求是否允许"""
+        now = time.time()
+        with self.lock:
+            # 清理过期记录
+            self.requests[client_ip] = [
+                t for t in self.requests[client_ip] 
+                if now - t < self.window_seconds
+            ]
+            # 检查是否超限
+            if len(self.requests[client_ip]) >= self.max_requests:
+                return False
+            # 记录本次请求
+            self.requests[client_ip].append(now)
+            return True
+
+# 全局速率限制器：每分钟最多60个请求/IP
+rate_limiter = RateLimiter(max_requests=60, window_seconds=60)
+
 from lxc_manager import LXCManager
 # 导入网络配置模块
 import network_setup
+# 导入异步任务管理器
+from async_task_manager import get_task_manager
 
 app = Flask(__name__)
 
-logging.basicConfig(level=getattr(logging, app_config.log_level, logging.INFO),
-                    format='%(asctime)s %(levelname)s: %(message)s [%(filename)s:%(lineno)d]',
-                    datefmt='%Y-%m-%d %H:%M:%S')
+# 配置日志（带轮换，防止无限增长）
+from logging.handlers import RotatingFileHandler
+
+log_level = getattr(logging, app_config.log_level, logging.INFO)
+log_format = logging.Formatter('%(asctime)s %(levelname)s: %(message)s [%(filename)s:%(lineno)d]',
+                               datefmt='%Y-%m-%d %H:%M:%S')
+
+# 控制台输出
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_format)
+console_handler.setLevel(log_level)
+
+# 文件输出（轮换：单文件最大10MB，保留5个备份）
+file_handler = RotatingFileHandler(
+    'lxd_api.log',
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5,
+    encoding='utf-8'
+)
+file_handler.setFormatter(log_format)
+file_handler.setLevel(log_level)
+
+# 配置根日志器
+logging.basicConfig(level=log_level, handlers=[console_handler, file_handler])
 logger = logging.getLogger(__name__)
 
 # 在服务启动时配置网络
@@ -57,11 +136,19 @@ def get_flow_manager():
 def api_key_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        client_ip = request.remote_addr
+        
+        # 速率限制检查
+        if not rate_limiter.is_allowed(client_ip):
+            logger.warning(f"API请求被速率限制拒绝: {client_ip}")
+            return jsonify({'code': 429, 'msg': '请求过于频繁，请稍后再试'}), 429
+        
+        # API Key 验证
         provided_key = request.headers.get('apikey')
         if provided_key and provided_key == app_config.token:
             return f(*args, **kwargs)
         else:
-            logger.warning(f"API认证失败: 无效的API Key from {request.remote_addr}.提供的Key: '{provided_key}'")
+            logger.warning(f"API认证失败: 无效的API Key from {client_ip}")
             return jsonify({'code': 401, 'msg': '认证失败或API密钥无效'}), 401
     return decorated_function
 
@@ -70,7 +157,7 @@ def api_key_required(f):
 @app.route('/api/check', methods=['GET'])
 @api_key_required
 def api_check():
-    logger.info(f"API /api/check a called successfully from {request.remote_addr}")
+    logger.info(f"API /api/check called successfully from {request.remote_addr}")
     return jsonify({'code': 200, 'msg': 'API连接正常'})
 
 @app.route('/api/getinfo', methods=['GET'])
@@ -80,17 +167,29 @@ def api_getinfo():
     if not hostname:
         logger.warning("API /api/getinfo 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+    valid, err_msg = validate_hostname(hostname)
+    if not valid:
+        logger.warning(f"API /api/getinfo hostname 验证失败: {err_msg}")
+        return jsonify({'code': 400, 'msg': err_msg}), 400
     logger.info(f"API请求getinfo for: {hostname}")
     return jsonify(lxc.get_container_info(hostname))
 
 @app.route('/api/create', methods=['POST'])
 @api_key_required
 def api_create():
+    """
+    创建容器 - 同步执行
+    注意：创建操作必须同步执行，因为前端需要获取容器的IP和端口信息来更新数据库
+    """
     try:
         payload = request.json
         if not payload or not payload.get('hostname'):
-            logger.warning(f"API /api/create 调用请求体无效或缺少hostname. Payload: {payload}")
+            logger.warning(f"API /api/create 调用请求体无效或缺少hostname")
             return jsonify({'code': 400, 'msg': '无效的请求体或缺少hostname'}), 400
+        valid, err_msg = validate_hostname(payload.get('hostname'))
+        if not valid:
+            logger.warning(f"API /api/create hostname 验证失败: {err_msg}")
+            return jsonify({'code': 400, 'msg': err_msg}), 400
         logger.info(f"API请求create for: {payload.get('hostname')}")
         return jsonify(lxc.create_container(payload))
     except Exception as e:
@@ -98,13 +197,17 @@ def api_create():
         return jsonify({'code': 500, 'msg': '服务器内部错误'}), 500
 
 
-@app.route('/api/delete', methods=['GET'])
+@app.route('/api/delete', methods=['GET', 'DELETE'])
 @api_key_required
 def api_delete():
     hostname = request.args.get('hostname')
     if not hostname:
         logger.warning("API /api/delete 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+    valid, err_msg = validate_hostname(hostname)
+    if not valid:
+        logger.warning(f"API /api/delete hostname 验证失败: {err_msg}")
+        return jsonify({'code': 400, 'msg': err_msg}), 400
     logger.info(f"API请求delete for: {hostname}")
     return jsonify(lxc.delete_container(hostname))
 
@@ -115,8 +218,12 @@ def api_boot():
     if not hostname:
         logger.warning("API /api/boot 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
-    logger.info(f"API请求boot for: {hostname}")
-    return jsonify(lxc.start_container(hostname))
+    
+    # 异步执行
+    task_manager = get_task_manager()
+    task_id = task_manager.submit_task('start', hostname, lxc.start_container, hostname)
+    logger.info(f"API请求boot for: {hostname}, 已提交异步任务 {task_id}")
+    return jsonify({'code': 200, 'msg': '开机指令已发送', 'task_id': task_id})
 
 @app.route('/api/stop', methods=['GET'])
 @api_key_required
@@ -125,8 +232,12 @@ def api_stop():
     if not hostname:
         logger.warning("API /api/stop 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
-    logger.info(f"API请求stop for: {hostname}")
-    return jsonify(lxc.stop_container(hostname))
+    
+    # 异步执行
+    task_manager = get_task_manager()
+    task_id = task_manager.submit_task('stop', hostname, lxc.stop_container, hostname)
+    logger.info(f"API请求stop for: {hostname}, 已提交异步任务 {task_id}")
+    return jsonify({'code': 200, 'msg': '关机指令已发送', 'task_id': task_id})
 
 @app.route('/api/reboot', methods=['GET'])
 @api_key_required
@@ -135,8 +246,12 @@ def api_reboot():
     if not hostname:
         logger.warning("API /api/reboot 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
-    logger.info(f"API请求reboot for: {hostname}")
-    return jsonify(lxc.restart_container(hostname))
+    
+    # 异步执行
+    task_manager = get_task_manager()
+    task_id = task_manager.submit_task('restart', hostname, lxc.restart_container, hostname)
+    logger.info(f"API请求reboot for: {hostname}, 已提交异步任务 {task_id}")
+    return jsonify({'code': 200, 'msg': '重启指令已发送', 'task_id': task_id})
 
 @app.route('/api/password', methods=['POST'])
 @api_key_required
@@ -146,7 +261,7 @@ def api_password():
         hostname = payload.get('hostname')
         new_pass = payload.get('password')
         if not hostname or not new_pass:
-            logger.warning(f"API /api/password 调用缺少hostname或password参数. Payload: {payload}")
+            logger.warning(f"API /api/password 调用缺少hostname或password参数. hostname: {payload.get('hostname') if payload else None}")
             return jsonify({'code': 400, 'msg': '缺少hostname或password参数'}), 400
         logger.info(f"API请求password change for: {hostname}")
         return jsonify(lxc.change_password(hostname, new_pass))
@@ -163,10 +278,19 @@ def api_reinstall():
         new_os = payload.get('system')
         new_password = payload.get('password')
         if not all([hostname, new_os, new_password]):
-            logger.warning(f"API /api/reinstall 调用缺少hostname, system或password参数. Payload: {payload}")
+            logger.warning(f"API /api/reinstall 调用缺少hostname, system或password参数. hostname: {payload.get('hostname') if payload else None}, system: {payload.get('system') if payload else None}")
             return jsonify({'code': 400, 'msg': '缺少hostname, system或password参数'}), 400
-        logger.info(f"API请求reinstall for: {hostname} with OS: {new_os}")
-        return jsonify(lxc.reinstall_container(hostname, new_os, new_password))
+        
+        # 先检查容器是否存在
+        container_info = lxc.get_container_info(hostname)
+        if container_info.get('code') == 404:
+            return jsonify({'code': 404, 'msg': '容器未找到'}), 404
+        
+        # 异步执行重装
+        task_manager = get_task_manager()
+        task_id = task_manager.submit_task('reinstall', hostname, lxc.reinstall_container, hostname, new_os, new_password)
+        logger.info(f"API请求reinstall for: {hostname} with OS: {new_os}, 已提交异步任务 {task_id}")
+        return jsonify({'code': 200, 'msg': '重装指令已发送，正在后台执行', 'task_id': task_id})
     except Exception as e:
         logger.error(f"处理 /api/reinstall 时发生意外错误: {e}", exc_info=True)
         return jsonify({'code': 500, 'msg': f'服务器内部错误: {e}'}), 500
@@ -624,6 +748,28 @@ def api_invalidate_cache():
     except Exception as e:
         logger.error(f"缓存失效失败: {e}")
         return jsonify({'code': 500, 'msg': f'缓存失效失败: {str(e)}'}), 500
+
+
+@app.route('/api/task/status', methods=['GET'])
+@api_key_required
+def api_task_status():
+    """
+    查询异步任务状态
+    
+    参数:
+        task_id: 任务ID
+    """
+    task_id = request.args.get('task_id')
+    if not task_id:
+        return jsonify({'code': 400, 'msg': '缺少task_id参数'}), 400
+    
+    task_manager = get_task_manager()
+    task_info = task_manager.get_task_status(task_id)
+    
+    if not task_info:
+        return jsonify({'code': 404, 'msg': '任务不存在或已过期'})
+    
+    return jsonify({'code': 200, 'msg': '获取成功', 'data': task_info})
 
 
 def startup_checks():

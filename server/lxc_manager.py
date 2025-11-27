@@ -2246,10 +2246,10 @@ class LXCManager:
                                     'chattr +i /etc/resolv.conf 2>/dev/null || true'
                                 ]
                             else:
-                                # Alpine 使用原来的简单方法
+                                # Alpine 使用 /bin/sh（BusyBox ash）
                                 dns_config_cmd = [
-                                    'bash', '-c',
-                                    'echo -e "nameserver 2a01:4f8:c2c:123f::1\\nnameserver 2a00:1098:2c::1\\nnameserver 2a01:4f9:c010:3f02::1" > /etc/resolv.conf'
+                                    '/bin/sh', '-c',
+                                    'printf "nameserver %s\\nnameserver %s\\nnameserver %s\\n" "2a01:4f8:c2c:123f::1" "2a00:1098:2c::1" "2a01:4f9:c010:3f02::1" > /etc/resolv.conf'
                                 ]
                             
                             result = new_container.execute(dns_config_cmd)

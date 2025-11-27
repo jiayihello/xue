@@ -9,6 +9,8 @@ __pycache__/
 
 # 日志文件
 *.log
+*.log.*
+lxd_api.log*
 
 # 数据库文件
 *.db
@@ -22,6 +24,9 @@ production_flow.env
 
 # 运行时数据
 iptables_rules.json
+nat_rules_metadata.json
+nat_rules_metadata.json.lock
+ipv6_allocations.json
 
 # 备份文件
 backup_*/

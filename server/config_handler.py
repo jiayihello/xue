@@ -44,11 +44,19 @@ class AppConfig:
         # 端口映射连通性自检开关（严格模式：失败即回滚并报错）。默认开启严格模式。
         self.portmap_selftest_strict = parser.getboolean('lxc', 'PORTMAP_SELFTEST_STRICT', fallback=True)
 
-        if not self.nat_listen_ip:
-            raise ValueError("配置文件 [lxc] 中必须设置 NAT_LISTEN_IP，因为NAT模式已固定开启")
+        # 配置验证：IPv6-Only 模式下不强制要求 NAT_LISTEN_IP
+        if self.ipv4_mode != 'OFF' and not self.nat_listen_ip:
+            raise ValueError("配置文件 [lxc] 中必须设置 NAT_LISTEN_IP（除非 IPV4_MODE=OFF）")
 
         if not self.main_interface:
             raise ValueError("配置文件 [lxc] 中必须设置 MAIN_INTERFACE (主网卡名)，用于iptables MASQUERADE规则")
+        
+        # IPv6-Only 模式额外验证
+        if self.ipv4_mode == 'OFF':
+            if self.ipv6_mode != 'ROUTED':
+                raise ValueError("IPV4_MODE=OFF（IPv6-Only模式）必须配合 IPV6_MODE=ROUTED 使用")
+            if not self.ipv6_prefix:
+                raise ValueError("IPV6_MODE=ROUTED 必须设置 IPV6_PREFIX")
 
         # 镜像相关配置（可选）
         self.prebuilt_image = parser.getboolean('image', 'PREBUILT_IMAGE', fallback=False)
