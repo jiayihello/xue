@@ -18,18 +18,44 @@
   python3 cpu_monitor_killer.py --dry-run               # 只显示不杀（测试模式）
 
 后台运行：
-  nohup python3 cpu_monitor_killer.py > cpu_killer.log 2>&1 &
+  nohup python3 cpu_monitor_killer.py &
+  
+日志文件：
+  tools/cpu_monitor.log  (自动轮转，5MB × 3份)
 """
 
 from __future__ import annotations  # Python 3.7+ 兼容性
 
 import argparse
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import time
 import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+
+# ==================== 日志配置 ====================
+
+# 日志文件路径（与脚本同目录）
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cpu_monitor.log')
+
+# 配置日志：同时输出到文件和控制台
+logger = logging.getLogger('cpu_monitor')
+logger.setLevel(logging.INFO)
+
+# 文件处理器（自动轮转：5MB × 3份）
+file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
+)
+file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+logger.addHandler(file_handler)
+
+# 控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+logger.addHandler(console_handler)
 
 # 添加父目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -66,8 +92,7 @@ BLACKLIST_PROCESSES = [
 # ==================== 工具函数 ====================
 
 def log(msg: str, level: str = 'INFO'):
-    """日志输出"""
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    """日志输出（同时写入文件和控制台）"""
     prefix = {
         'INFO': '✓',
         'WARN': '⚠️',
@@ -75,8 +100,15 @@ def log(msg: str, level: str = 'INFO'):
         'KILL': '🔪',
         'SKIP': '⏭️'
     }.get(level, 'ℹ️')
-    print(f"[{timestamp}] {prefix} {msg}")
-    sys.stdout.flush()
+    
+    log_msg = f"{prefix} {msg}"
+    
+    if level == 'ERROR':
+        logger.error(log_msg)
+    elif level == 'WARN':
+        logger.warning(log_msg)
+    else:
+        logger.info(log_msg)
 
 
 def get_container_cpu_usage(client: Client, container_name: str, interval: float = 2.0) -> float:
