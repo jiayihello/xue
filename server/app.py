@@ -63,8 +63,11 @@ rate_limiter = RateLimiter(max_requests=60, window_seconds=60)
 from lxc_manager import LXCManager
 # 导入网络配置模块
 import network_setup
-# 导入异步任务管理器
-from async_task_manager import get_task_manager
+# 导入 Celery 任务
+from tasks import (
+    start_container_task, stop_container_task, restart_container_task,
+    reinstall_container_task, celery_app
+)
 
 app = Flask(__name__)
 
@@ -218,12 +221,18 @@ def api_boot():
     if not hostname:
         logger.warning("API /api/boot 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+    valid, err_msg = validate_hostname(hostname)
+    if not valid:
+        return jsonify({'code': 400, 'msg': err_msg}), 400
     
-    # 异步执行
-    task_manager = get_task_manager()
-    task_id = task_manager.submit_task('start', hostname, lxc.start_container, hostname)
-    logger.info(f"API请求boot for: {hostname}, 已提交异步任务 {task_id}")
-    return jsonify({'code': 200, 'msg': '开机指令已发送', 'task_id': task_id})
+    # 异步执行 (Celery)
+    try:
+        task = start_container_task.delay(hostname)
+        logger.info(f"API请求boot for: {hostname}, 已提交异步任务 {task.id}")
+        return jsonify({'code': 200, 'msg': '开机指令已发送', 'task_id': task.id})
+    except Exception as e:
+        logger.error(f"提交异步任务失败: {e}")
+        return jsonify({'code': 500, 'msg': f'任务提交失败，请检查Celery服务: {e}'}), 500
 
 @app.route('/api/stop', methods=['GET'])
 @api_key_required
@@ -232,12 +241,18 @@ def api_stop():
     if not hostname:
         logger.warning("API /api/stop 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+    valid, err_msg = validate_hostname(hostname)
+    if not valid:
+        return jsonify({'code': 400, 'msg': err_msg}), 400
     
-    # 异步执行
-    task_manager = get_task_manager()
-    task_id = task_manager.submit_task('stop', hostname, lxc.stop_container, hostname)
-    logger.info(f"API请求stop for: {hostname}, 已提交异步任务 {task_id}")
-    return jsonify({'code': 200, 'msg': '关机指令已发送', 'task_id': task_id})
+    # 异步执行 (Celery)
+    try:
+        task = stop_container_task.delay(hostname)
+        logger.info(f"API请求stop for: {hostname}, 已提交异步任务 {task.id}")
+        return jsonify({'code': 200, 'msg': '关机指令已发送', 'task_id': task.id})
+    except Exception as e:
+        logger.error(f"提交异步任务失败: {e}")
+        return jsonify({'code': 500, 'msg': f'任务提交失败，请检查Celery服务: {e}'}), 500
 
 @app.route('/api/reboot', methods=['GET'])
 @api_key_required
@@ -246,12 +261,18 @@ def api_reboot():
     if not hostname:
         logger.warning("API /api/reboot 调用缺少 hostname 参数")
         return jsonify({'code': 400, 'msg': '缺少hostname参数'}), 400
+    valid, err_msg = validate_hostname(hostname)
+    if not valid:
+        return jsonify({'code': 400, 'msg': err_msg}), 400
     
-    # 异步执行
-    task_manager = get_task_manager()
-    task_id = task_manager.submit_task('restart', hostname, lxc.restart_container, hostname)
-    logger.info(f"API请求reboot for: {hostname}, 已提交异步任务 {task_id}")
-    return jsonify({'code': 200, 'msg': '重启指令已发送', 'task_id': task_id})
+    # 异步执行 (Celery)
+    try:
+        task = restart_container_task.delay(hostname)
+        logger.info(f"API请求reboot for: {hostname}, 已提交异步任务 {task.id}")
+        return jsonify({'code': 200, 'msg': '重启指令已发送', 'task_id': task.id})
+    except Exception as e:
+        logger.error(f"提交异步任务失败: {e}")
+        return jsonify({'code': 500, 'msg': f'任务提交失败，请检查Celery服务: {e}'}), 500
 
 @app.route('/api/password', methods=['POST'])
 @api_key_required
@@ -286,11 +307,14 @@ def api_reinstall():
         if container_info.get('code') == 404:
             return jsonify({'code': 404, 'msg': '容器未找到'}), 404
         
-        # 异步执行重装
-        task_manager = get_task_manager()
-        task_id = task_manager.submit_task('reinstall', hostname, lxc.reinstall_container, hostname, new_os, new_password)
-        logger.info(f"API请求reinstall for: {hostname} with OS: {new_os}, 已提交异步任务 {task_id}")
-        return jsonify({'code': 200, 'msg': '重装指令已发送，正在后台执行', 'task_id': task_id})
+        # 异步执行重装 (Celery)
+        try:
+            task = reinstall_container_task.delay(hostname, new_os, new_password)
+            logger.info(f"API请求reinstall for: {hostname} with OS: {new_os}, 已提交异步任务 {task.id}")
+            return jsonify({'code': 200, 'msg': '重装指令已发送，正在后台执行', 'task_id': task.id})
+        except Exception as e:
+            logger.error(f"提交重装任务失败: {e}")
+            return jsonify({'code': 500, 'msg': f'任务提交失败，请检查Celery服务: {e}'}), 500
     except Exception as e:
         logger.error(f"处理 /api/reinstall 时发生意外错误: {e}", exc_info=True)
         return jsonify({'code': 500, 'msg': f'服务器内部错误: {e}'}), 500
@@ -754,7 +778,7 @@ def api_invalidate_cache():
 @api_key_required
 def api_task_status():
     """
-    查询异步任务状态
+    查询异步任务状态 (Celery)
     
     参数:
         task_id: 任务ID
@@ -763,11 +787,31 @@ def api_task_status():
     if not task_id:
         return jsonify({'code': 400, 'msg': '缺少task_id参数'}), 400
     
-    task_manager = get_task_manager()
-    task_info = task_manager.get_task_status(task_id)
+    # 使用 Celery AsyncResult 查询任务状态
+    from celery.result import AsyncResult
+    task_result = AsyncResult(task_id, app=celery_app)
     
-    if not task_info:
-        return jsonify({'code': 404, 'msg': '任务不存在或已过期'})
+    # 状态映射
+    status_map = {
+        'PENDING': 'pending',
+        'STARTED': 'running',
+        'SUCCESS': 'success',
+        'FAILURE': 'failed',
+        'RETRY': 'running',
+        'REVOKED': 'failed'
+    }
+    
+    task_info = {
+        'task_id': task_id,
+        'status': status_map.get(task_result.status, task_result.status.lower()),
+        'result': None,
+        'error': None
+    }
+    
+    if task_result.successful():
+        task_info['result'] = task_result.result
+    elif task_result.failed():
+        task_info['error'] = str(task_result.result)
     
     return jsonify({'code': 200, 'msg': '获取成功', 'data': task_info})
 

@@ -61,4 +61,8 @@ class AppConfig:
         # 镜像相关配置（可选）
         self.prebuilt_image = parser.getboolean('image', 'PREBUILT_IMAGE', fallback=False)
 
+        # Celery 配置
+        self.celery_broker_url = parser.get('celery', 'BROKER_URL', fallback='redis://127.0.0.1:6379/0')
+        self.celery_result_backend = parser.get('celery', 'RESULT_BACKEND', fallback='redis://127.0.0.1:6379/1')
+
 app_config = AppConfig()

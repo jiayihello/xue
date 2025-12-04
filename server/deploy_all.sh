@@ -82,9 +82,26 @@ echo ""
 check_root
 
 # ==========================================
-# 步骤 1: 安装 Python 依赖
+# 步骤 1: 安装系统依赖和 Python 依赖
 # ==========================================
-log_step "步骤 1/6: 安装 Python 依赖"
+log_step "步骤 1/6: 安装系统依赖和 Python 依赖"
+
+# 安装 Redis（Celery 需要）
+log_info "安装 Redis..."
+if command -v apt-get &> /dev/null; then
+    apt-get update -qq
+    apt-get install -y -qq redis-server
+    systemctl enable redis-server
+    systemctl start redis-server
+    log_ok "Redis 安装完成"
+elif command -v yum &> /dev/null; then
+    yum install -y -q redis
+    systemctl enable redis
+    systemctl start redis
+    log_ok "Redis 安装完成"
+else
+    log_warn "无法自动安装 Redis，请手动安装"
+fi
 
 if [ -f "requirements.txt" ]; then
     log_info "安装 requirements.txt 中的依赖..."
@@ -461,6 +478,18 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
         fi
     fi
     
+    # 添加 Celery 配置（如果不存在）
+    if ! grep -q "^\[celery\]" app.ini; then
+        log_info "添加 Celery 配置..."
+        cat >> app.ini << 'CELERY_EOF'
+
+[celery]
+BROKER_URL = redis://127.0.0.1:6379/0
+RESULT_BACKEND = redis://127.0.0.1:6379/1
+CELERY_EOF
+        log_ok "Celery 配置已添加"
+    fi
+    
     log_ok "✓ app.ini 网络配置已更新"
     log_info "  MAIN_INTERFACE = $MAIN_INTERFACE"
     if [ "$IPV6_INTERFACE" != "$MAIN_INTERFACE" ]; then
@@ -487,11 +516,33 @@ if ask_yes_no "是否创建并启用后端 API 服务?" "y"; then
         # 手动创建服务
         log_info "手动创建 systemd 服务..."
         
+        # 创建 Celery Worker 服务
+        log_info "创建 Celery Worker 服务..."
+        cat > /etc/systemd/system/lxd-celery.service << EOF
+[Unit]
+Description=LXD Celery Worker
+After=network.target redis-server.service
+Requires=redis-server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=/usr/bin/python3 -m celery -A tasks worker --loglevel=info --concurrency=2
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        # 创建 API 服务
         cat > /etc/systemd/system/lxd-api.service << EOF
 [Unit]
 Description=LXD API Service
-After=network.target snap.lxd.daemon.service lxd.service
+After=network.target snap.lxd.daemon.service lxd.service redis-server.service lxd-celery.service
 Wants=snap.lxd.daemon.service lxd.service
+Requires=lxd-celery.service
 
 [Service]
 Type=simple
@@ -506,13 +557,17 @@ WantedBy=multi-user.target
 EOF
         
         systemctl daemon-reload
-        systemctl enable lxd-api.service
+        systemctl enable lxd-celery.service lxd-api.service
+        systemctl start lxd-celery.service
+        sleep 2
         systemctl start lxd-api.service
         
-        if systemctl is-active --quiet lxd-api.service; then
-            log_ok "后端服务已启动"
+        if systemctl is-active --quiet lxd-api.service && systemctl is-active --quiet lxd-celery.service; then
+            log_ok "后端服务已启动（API + Celery Worker）"
         else
-            log_error "后端服务启动失败，请检查日志: journalctl -u lxd-api.service -n 50"
+            log_error "后端服务启动失败，请检查日志:"
+            log_error "  journalctl -u lxd-api.service -n 50"
+            log_error "  journalctl -u lxd-celery.service -n 50"
         fi
     fi
 else
@@ -591,8 +646,13 @@ fi
 
 # API 服务
 echo -e "${COLOR_CYAN}API 服务:${COLOR_NC}"
+if systemctl is-active --quiet lxd-celery.service; then
+    echo "  ✅ Celery Worker: 运行中"
+else
+    echo "  ⚠️  Celery Worker: 未运行"
+fi
 if systemctl is-active --quiet lxd-api.service; then
-    echo "  ✅ 后端服务: 运行中"
+    echo "  ✅ API 服务: 运行中"
     
     # 获取端口
     PORT=$(grep -oP '(?<=port = )\d+' app.ini 2>/dev/null || echo "8080")
@@ -644,7 +704,7 @@ if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
     echo "  查询容器流量:       python3 $SCRIPT_DIR/flow_manager_v2.py info <容器名>"
     echo "  重置容器流量:       python3 $SCRIPT_DIR/flow_manager_v2.py reset <容器名>"
 fi
-echo "  查看服务状态:       systemctl status lxd-api.service"
+echo "  查看服务状态:       systemctl status lxd-api.service lxd-celery.service"
 if [ "$ENABLE_FLOW_MANAGEMENT" = true ]; then
     echo "  查看事件监听器:     systemctl status lxd-event-listener.service"
     echo "  查看定时器状态:     systemctl list-timers lxd-flow-*"

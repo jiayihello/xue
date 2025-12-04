@@ -66,9 +66,17 @@ IPV6_INTERFACE =
 # 若留空，则端口监听使用 ::（全部地址）；但为了让容器出网正常，仍建议提供一个稳定的 /128
 NAT_LISTEN_IPV6 =
 
+# ===================== Celery 配置 =====================
+# 异步任务队列配置（需要安装 Redis）
+[celery]
+# Redis 消息代理地址
+BROKER_URL = redis://127.0.0.1:6379/0
+# Redis 结果存储地址
+RESULT_BACKEND = redis://127.0.0.1:6379/1
+
 # ===================== 使用提示 =====================
 # 1) 公有云/EIP 场景：
-#    - NAT_LISTEN_IP 建议使用 0.0.0.0 或本机实际 IPv4；不要直接填 EIP，否则会出现 “Address not available”。
+#    - NAT_LISTEN_IP 建议使用 0.0.0.0 或本机实际 IPv4；不要直接填 EIP，否则会出现 "Address not available"。
 # 2) 宽松模式（PORTMAP_SELFTEST_STRICT=false）：
 #    - 前端创建会成功，但若当时容器未监听，会在返回 JSON 的 warnings 字段中提示。
 # 3) NAT66 出网：
@@ -77,4 +85,6 @@ NAT_LISTEN_IPV6 =
 #    - 后端会为容器添加 routed 类型 IPv6 网卡和 NDP 代理项；需要你的上游/安全组允许 IPv6 通信。
 # 5) 安全组/防火墙：
 #    - 记得放行你对外公布的端口（IPv4/IPv6）。
-
+# 6) Celery 异步任务：
+#    - 需要安装 Redis：apt install redis-server
+#    - 启动 Worker：celery -A tasks worker --loglevel=info --concurrency=2
