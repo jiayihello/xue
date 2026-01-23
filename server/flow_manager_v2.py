@@ -301,6 +301,101 @@ class FlowManagerV2:
             logger.error(f"列出容器失败: {e}")
             return []
     
+    def _run_command(self, args: list, use_sudo: bool = True) -> Tuple[bool, str]:
+        """执行命令"""
+        import subprocess
+        cmd = ['sudo'] + args if use_sudo else args
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            if result.returncode != 0:
+                return False, result.stderr.strip()
+            return True, result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            return False, "命令超时"
+        except Exception as e:
+            return False, str(e)
+    
+    def _get_iptables_rule_numbers(self, hostname: str, use_ipv6: bool = False) -> List[int]:
+        """
+        获取容器在 LXD_FLOW_ACCOUNTING 链中的规则行号
+        
+        Args:
+            hostname: 容器名
+            use_ipv6: 是否查询 ip6tables
+        
+        Returns:
+            规则行号列表
+        """
+        import re
+        rule_numbers = []
+        cmd = 'ip6tables' if use_ipv6 else 'iptables'
+        
+        success, output = self._run_command([
+            cmd, '-L', 'LXD_FLOW_ACCOUNTING', '-v', '-n', '-x', '--line-numbers'
+        ])
+        
+        if not success:
+            # 链不存在不算错误
+            if 'No chain' not in output and 'does not exist' not in output:
+                logger.warning(f"获取 {cmd} 规则失败: {output}")
+            return rule_numbers
+        
+        # 解析输出，查找包含 hostname 的规则
+        for line in output.split('\n'):
+            if hostname.lower() in line.lower():
+                match = re.match(r'^(\d+)\s+', line)
+                if match:
+                    rule_numbers.append(int(match.group(1)))
+        
+        return rule_numbers
+    
+    def _reset_iptables_counters(self, hostname: str) -> Tuple[int, int]:
+        """
+        清零容器的 iptables 和 ip6tables 计数器
+        
+        Args:
+            hostname: 容器名
+            
+        Returns:
+            (ipv4清零数, ipv6清零数)
+        """
+        ipv4_count = 0
+        ipv6_count = 0
+        
+        # 清零 IPv4 (iptables)
+        rule_numbers = self._get_iptables_rule_numbers(hostname, use_ipv6=False)
+        for rule_num in rule_numbers:
+            success, error = self._run_command([
+                'iptables', '-Z', 'LXD_FLOW_ACCOUNTING', str(rule_num)
+            ])
+            if success:
+                ipv4_count += 1
+            else:
+                logger.warning(f"清零 iptables 规则 {rule_num} 失败: {error}")
+        
+        # 清零 IPv6 (ip6tables)
+        rule_numbers = self._get_iptables_rule_numbers(hostname, use_ipv6=True)
+        for rule_num in rule_numbers:
+            success, error = self._run_command([
+                'ip6tables', '-Z', 'LXD_FLOW_ACCOUNTING', str(rule_num)
+            ])
+            if success:
+                ipv6_count += 1
+            else:
+                logger.warning(f"清零 ip6tables 规则 {rule_num} 失败: {error}")
+        
+        if ipv4_count > 0 or ipv6_count > 0:
+            logger.info(f"✓ 容器 {hostname} 已清零计数器 (iptables: {ipv4_count}, ip6tables: {ipv6_count})")
+        else:
+            logger.info(f"容器 {hostname} 没有找到 iptables/ip6tables 规则")
+        
+        return ipv4_count, ipv6_count
+
     def reset_container_flow(self, hostname: str, reset_type: str = 'manual') -> bool:
         """
         重置容器流量
@@ -313,16 +408,8 @@ class FlowManagerV2:
             是否成功
         """
         try:
-            # 🔥 重要修复：先读取当前 iptables 计数器，避免重复计算
-            try:
-                from iptables_manager import IptablesManager
-                iptables_mgr = IptablesManager()
-                traffic_stats = iptables_mgr.get_traffic_stats(hostname)
-                current_iptables_bytes = traffic_stats['bytes_sent'] + traffic_stats['bytes_received']
-                logger.debug(f"容器 {hostname} 当前 iptables 计数器: {current_iptables_bytes} bytes")
-            except Exception as e:
-                logger.warning(f"读取容器 {hostname} iptables 计数器失败，使用 0: {e}")
-                current_iptables_bytes = 0
+            # 🔥 第一步：清零 iptables 和 ip6tables 计数器
+            self._reset_iptables_counters(hostname)
             
             with sqlite3.connect(self.db_path) as conn:
                 # 获取当前流量
@@ -348,18 +435,17 @@ class FlowManagerV2:
                     # 手动重置，从今天开始计算
                     new_reset_date = self._calculate_next_reset_date(date.today())
                 
-                # 🔥 重要修复：将 last_iptables_bytes 设为当前值（不是 0）
-                # 这样下次收集时才能正确计算增量
+                # 🔥 重要：iptables 计数器已清零，所以 last_iptables_bytes 也设为 0
                 conn.execute("""
                     UPDATE container_flow_v2
                     SET period_total_bytes = 0,
-                        last_iptables_bytes = ?,
+                        last_iptables_bytes = 0,
                         next_reset_date = ?,
                         is_blocked = 0,
                         reset_count = reset_count + 1,
                         updated_at = ?
                     WHERE hostname = ?
-                """, (current_iptables_bytes, new_reset_date, datetime.now(), hostname))
+                """, (new_reset_date, datetime.now(), hostname))
                 
                 # 记录历史
                 conn.execute("""
@@ -368,9 +454,8 @@ class FlowManagerV2:
                     VALUES (?, ?, ?, ?)
                 """, (hostname, date.today(), reset_type, old_usage_gb))
                 
-                logger.info(f"✓ 容器 {hostname} 流量已重置: "
+                logger.info(f"✓ 容器 {hostname} 流量已完整重置: "
                           f"{old_usage_gb:.2f}GB → 0GB，下次重置: {new_reset_date}")
-                logger.debug(f"容器 {hostname} iptables 快照已更新: {current_iptables_bytes} bytes")
                 return True
                 
         except Exception as e:

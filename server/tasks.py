@@ -2,6 +2,12 @@
 Celery 异步任务定义
 用于处理耗时的容器操作（重装、开关机等）
 """
+import sys
+import os
+
+# 确保当前目录在 Python 路径中
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from celery import Celery
 from config_handler import app_config
 import logging
