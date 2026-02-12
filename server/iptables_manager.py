@@ -262,6 +262,13 @@ class IptablesManager:
     def _setup_ipv4_rules(self, hostname: str, ipv4: str) -> bool:
         """创建 IPv4 规则"""
         # ✅ 出站流量规则（源地址匹配）- 添加到 LXD_FLOW_ACCOUNTING 链
+        # 先检查规则是否已存在
+        check_cmd = ["iptables", "-L", "LXD_FLOW_ACCOUNTING", "-n"]
+        success, output = self._run_command(check_cmd)
+        if success and f"flow-{hostname}-out" in output:
+            logger.debug(f"IPv4 规则已存在: {hostname}")
+            return True
+
         cmd_out = [
             'iptables', '-A', 'LXD_FLOW_ACCOUNTING',
             '-s', ipv4,
@@ -288,6 +295,13 @@ class IptablesManager:
     def _setup_ipv6_rules(self, hostname: str, ipv6: str) -> bool:
         """创建 IPv6 规则"""
         # ✅ 出站流量规则 - 添加到 LXD_FLOW_ACCOUNTING 链
+        # 先检查规则是否已存在
+        check_cmd = ["ip6tables", "-L", "LXD_FLOW_ACCOUNTING", "-n"]
+        success, output = self._run_command(check_cmd)
+        if success and f"flow-{hostname}-out" in output:
+            logger.debug(f"IPv6 规则已存在: {hostname}")
+            return True
+
         cmd_out = [
             'ip6tables', '-A', 'LXD_FLOW_ACCOUNTING',
             '-s', ipv6,

@@ -301,7 +301,7 @@ class FlowManagerV2:
             logger.error(f"列出容器失败: {e}")
             return []
     
-    def _run_command(self, args: list, use_sudo: bool = True) -> Tuple[bool, str]:
+    def _run_command(self, args: list, use_sudo: bool = False) -> Tuple[bool, str]:
         """执行命令"""
         import subprocess
         cmd = ['sudo'] + args if use_sudo else args

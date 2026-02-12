@@ -246,6 +246,13 @@ class LXCManager:
         """
         return container_name
 
+    def get_container_name_by_hostname(self, hostname):
+        try:
+            container = self.client.containers.get(hostname)
+            return container.name
+        except Exception:
+            return None
+
     def _get_container_or_error(self, hostname):
         try:
             return self.client.containers.get(hostname)
@@ -356,7 +363,7 @@ class LXCManager:
             logger.debug(f"已删除容器元数据: {config_key}")
 
     def _run_shell_command_for_iptables(self, command_args):
-        full_command = ['sudo', 'iptables'] + command_args
+        full_command = ['iptables'] + command_args
         try:
             logger.debug(f"执行iptables命令: {' '.join(full_command)}")
             process = subprocess.Popen(full_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
